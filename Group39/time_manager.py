@@ -18,7 +18,6 @@ class TimeManager:
     - 时间分配
     - 时间跟踪
     """
-    
     def __init__(self):
         self.start_time: Optional[float] = None
         self.total_time_limit = 270.0  # 4分半（秒）

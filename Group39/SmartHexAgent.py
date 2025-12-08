@@ -27,7 +27,6 @@ class SmartHexAgent(AgentBase):
     - 连接性评估
     - 智能时间管理
     """
-    
     def __init__(self, colour: Colour):
         super().__init__(colour)
         
