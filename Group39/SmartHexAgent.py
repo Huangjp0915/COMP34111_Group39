@@ -1,6 +1,8 @@
 """
 Group39 Hex AI Agent - 主代理类
 """
+import copy
+
 from src.AgentBase import AgentBase
 from src.Board import Board
 from src.Colour import Colour
@@ -13,7 +15,7 @@ from .pattern_recognizer import PatternRecognizer
 from .time_manager import TimeManager
 # from .neural_evaluator import NeuralEvaluator
 from .utils import logger
-
+from typing import Optional
 
 class SmartHexAgent(AgentBase):
     """
@@ -42,8 +44,62 @@ class SmartHexAgent(AgentBase):
         self.last_move = None
         self.turn_count = 0
         self.has_swapped = False
-    
-    def make_move(self, turn: int, board: Board, opp_move: Move | None) -> Move:
+
+    def _find_winning_move_by_simulation(self, board: Board, colour: Colour) -> Optional[Move]:
+        """
+        暴力检查：是否存在“一步即胜”的落子。
+        对每个空位尝试落子，调用 has_ended 判断是否立刻获胜。
+        """
+        size = board.size
+        for x in range(size):
+            for y in range(size):
+                if board.tiles[x][y].colour is None:
+                    test_board = copy.deepcopy(board)
+                    test_board.set_tile_colour(x, y, colour)
+                    if test_board.has_ended(colour):
+                        return Move(x, y)
+        return None
+
+    def _check_priority_moves(self, board: Board) -> Optional[Move]:
+        """
+        显式规则层：
+        1. 先看我方有没有“一步必杀”
+        2. 再看对手有没有“一步必胜”（需要必防）
+        都没有则返回 None
+        """
+        # 1) 我方必杀
+        win_move = self._find_winning_move_by_simulation(board, self.colour)
+        if win_move is not None:
+            return win_move
+
+        # 2) 对方必胜 => 我方必防
+        opp = self.opp_colour()
+        block_move = self._find_winning_move_by_simulation(board, opp)
+        if block_move is not None:
+            return block_move
+
+        return None
+
+    def _is_board_empty(self, board: Board) -> bool:
+        """检查棋盘是否完全为空,用于规范先手位置"""
+        size = board.size
+        for x in range(size):
+            for y in range(size):
+                if board.tiles[x][y].colour is not None:
+                    return False
+        return True
+
+    def _is_my_first_move(self, board: Board) -> bool:
+        """判断这是不是我在本局中的第一颗棋子。无论我是先手还是后手/是否发生过交换，都只看棋盘上有没有属于我的棋子。
+        """
+        size = board.size
+        for x in range(size):
+            for y in range(size):
+                if board.tiles[x][y].colour == self.colour:
+                    return False
+        return True
+
+    def make_move(self, turn: int, board: Board, opp_move: Optional[Move]) -> Move:
         """
         主决策函数
         
@@ -60,8 +116,18 @@ class SmartHexAgent(AgentBase):
         try:
             # 0. 时间安全检查
             remaining_time = self.time_manager.get_remaining_time()
-            if remaining_time < 0.05:  # 少于50ms
+            if remaining_time < 0.05:
                 return self._get_quick_move(board)
+
+            # 0.5 开局特判：如果是第一手并且棋盘是空的，直接下中心
+            if turn == 1 and self._is_board_empty(board):
+                size = board.size
+                center = size // 2
+                move = Move(center, center)
+                # 保险起见再检查一下合法性
+                if self._is_valid_move(move, board):
+                    self.last_move = move
+                    return move
             
             # 1. 处理对手的交换（如果对手在turn==2交换了，游戏引擎会自动改变我们的颜色）
             # 但我们需要更新has_swapped状态
@@ -96,6 +162,18 @@ class SmartHexAgent(AgentBase):
                     return Move(x, y)  # 立即获胜（最高优先级）
                 elif threat_type == "LOSE":
                     return Move(x, y)  # 必须阻止
+
+            # 3.2 规则层“必杀必防”兜底检查（独立于 ThreatDetector）
+            priority_move = self._check_priority_moves(board)
+            if priority_move is not None:
+                return priority_move
+
+            # 3.3 如果这是我在本局的第一颗棋子，无论先后手，都优先靠近中心落子
+            if self._is_my_first_move(board):
+                move = self._get_first_valid_move(board)
+                if self._is_valid_move(move, board):
+                    self.last_move = move
+                    return move
             
             # 4. 时间分配
             total_turns_remaining = self._estimate_remaining_turns(board)
@@ -158,7 +236,7 @@ class SmartHexAgent(AgentBase):
             traceback.print_exc()
             return self._get_fallback_move(board)
     
-    def _decide_swap(self, board: Board, opp_move: Move | None) -> Move:
+    def _decide_swap(self, board: Board, opp_move: Optional[Move]) -> Move:
         """
         第二回合的交换决策
         使用连接性评估判断是否交换
@@ -274,24 +352,31 @@ class SmartHexAgent(AgentBase):
         except Exception as e:
             logger.error(f"Error in quick move: {e}")
             return self._get_first_valid_move(board)
-    
+
     def _get_first_valid_move(self, board: Board) -> Move:
         """
-        返回第一个合法走法
-        
-        Args:
-            board: 当前棋盘状态
-        
-        Returns:
-            Move: 第一个空位的走法
+        返回一个“相对合理”的合法走法：
+        - 开局/兜底时，优先选择靠近棋盘中心的空位
+        - 如果没有空位（理论上不会发生），返回交换
         """
-        for x in range(board.size):
-            for y in range(board.size):
+        size = board.size
+        center = size // 2
+        candidates = []
+
+        # 收集所有空位，并计算到中心的曼哈顿距离
+        for x in range(size):
+            for y in range(size):
                 if board.tiles[x][y].colour is None:
-                    return Move(x, y)
-        
-        # 如果棋盘已满（理论上不会发生），返回交换
-        return Move(-1, -1)
+                    dist = abs(x - center) + abs(y - center)
+                    candidates.append((dist, x, y))
+
+        if not candidates:
+            return Move(-1, -1)
+
+        # 按距离升序排序，取距离最小的那个
+        candidates.sort(key=lambda t: t[0])
+        _, best_x, best_y = candidates[0]
+        return Move(best_x, best_y)
     
     def _is_valid_move(self, move: Move, board: Board) -> bool:
         """

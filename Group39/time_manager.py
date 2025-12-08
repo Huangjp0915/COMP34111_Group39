@@ -6,7 +6,7 @@ from typing import Optional
 
 from src.Board import Board
 from src.Colour import Colour
-
+from src.Tile import Tile
 
 class TimeManager:
     """
@@ -21,8 +21,73 @@ class TimeManager:
     
     def __init__(self):
         self.start_time: Optional[float] = None
-        self.total_time_limit = 180.0  # 3分钟（秒）
+        self.total_time_limit = 270.0  # 4分半（秒）
         self.used_time = 0.0
+
+    def _count_connections(self, board: Board, colour: Colour) -> int:
+        """统计某一方的“直接连接边数”，用于衡量局面结构复杂度"""
+        connections = 0
+        size = board.size
+        for x in range(size):
+            for y in range(size):
+                if board.tiles[x][y].colour == colour:
+                    # 检查六个方向的邻居
+                    for idx in range(Tile.NEIGHBOUR_COUNT):
+                        x_n = x + Tile.I_DISPLACEMENTS[idx]
+                        y_n = y + Tile.J_DISPLACEMENTS[idx]
+                        if 0 <= x_n < size and 0 <= y_n < size:
+                            if board.tiles[x_n][y_n].colour == colour:
+                                connections += 1
+        return connections // 2
+
+    def _is_bridge_position(self, board: Board, x: int, y: int) -> bool:
+        """判断 (x, y) 是否为“桥接位置”：周围同色或对方棋子较多，通常是关键点"""
+        size = board.size
+        red_count = 0
+        blue_count = 0
+        for idx in range(Tile.NEIGHBOUR_COUNT):
+            x_n = x + Tile.I_DISPLACEMENTS[idx]
+            y_n = y + Tile.J_DISPLACEMENTS[idx]
+            if 0 <= x_n < size and 0 <= y_n < size:
+                c = board.tiles[x_n][y_n].colour
+                if c == Colour.RED:
+                    red_count += 1
+                elif c == Colour.BLUE:
+                    blue_count += 1
+        # 周围同一方或对方棋子数量>= 2就认为是关键桥位
+        return red_count >= 2 or blue_count >= 2
+
+    def _count_critical_positions(self, board: Board) -> int:
+        """统计关键位置数量（桥接点、必争点）"""
+        critical = 0
+        size = board.size
+        for x in range(size):
+            for y in range(size):
+                if board.tiles[x][y].colour is None:
+                    if self._is_bridge_position(board, x, y):
+                        critical += 1
+        return critical
+
+    def _calculate_structural_complexity(self, board: Board) -> float:
+        """计算局面“结构复杂度”（连接数 + 关键点），返回 0~1 之间的值"""
+        red_conn = self._count_connections(board, Colour.RED)
+        blue_conn = self._count_connections(board, Colour.BLUE)
+        total_conn = red_conn + blue_conn
+        critical_positions = self._count_critical_positions(board)
+        score = 1.0
+        # 连接数影响（more连接=more复杂）
+        if total_conn > 15:
+            score *= 1.3
+        elif total_conn > 8:
+            score *= 1.1
+        # 关键位置影响
+        if critical_positions > 5:
+            score *= 1.2
+        # 限制到[1.0,1.5]
+        score = min(score, 1.5)
+        # 归一化到[0,1]，1.0->0，1.5->1
+        normalized = (score - 1.0) / 0.5
+        return max(0.0, min(1.0, normalized))
     
     def start_timer(self):
         """开始计时"""
@@ -61,70 +126,71 @@ class TimeManager:
         Returns:
             float: 归一化的复杂度（0到1）
         """
+        size = board.size
+        total_tiles = size * size
+
         # 1. 统计空位数（主要因素）
         empty_tiles = sum(
-            1 for x in range(board.size) 
-            for y in range(board.size) 
+            1
+            for x in range(size)
+            for y in range(size)
             if board.tiles[x][y].colour is None
         )
-        total_tiles = board.size * board.size
         empty_ratio = empty_tiles / total_tiles if total_tiles > 0 else 0.0
         
         # 2. 检测威胁数（重要因素）
         threat_count = 0
         if threat_detector and opp_colour:
-            immediate_threats = threat_detector.detect_immediate_threats(board, opp_colour)
-            threat_count = len(immediate_threats)
+            try:
+                immediate_threats = threat_detector.detect_immediate_threats(board, opp_colour)
+                threat_count = len(immediate_threats)
+            except Exception:
+                threat_count = 0
         
         # 3. 游戏阶段因子（早期更复杂，因为选择更多）
         # 早期（空位>70%）：复杂度高
         # 中期（30%<空位<70%）：复杂度中等
         # 后期（空位<30%）：复杂度低
         if empty_ratio > 0.7:
-            phase_factor = 1.2  # 早期：更复杂
+            phase_factor = 1.2  # 早期：复杂度略高
         elif empty_ratio < 0.3:
-            phase_factor = 0.7  # 后期：较简单
+            phase_factor = 0.7  # 后期：相对简单
         else:
             phase_factor = 1.0  # 中期：正常
         
         # 4. 连接性复杂度（双方连接成本差异）
         connectivity_complexity = 0.0
-        if threat_detector:  # 如果有威胁检测器，说明可以访问连接性评估器
+        if threat_detector:
             try:
                 from .connectivity_evaluator import ConnectivityEvaluator
                 evaluator = ConnectivityEvaluator()
-                
-                # 计算双方的连接成本
                 red_cost = evaluator.shortest_path_cost(board, Colour.RED)
                 blue_cost = evaluator.shortest_path_cost(board, Colour.BLUE)
-                
-                # 如果双方都很接近连接（成本低），局面更复杂
-                # 如果一方已经连接，复杂度降低
-                if red_cost != float('inf') and blue_cost != float('inf'):
+                if red_cost != float("inf") and blue_cost != float("inf"):
                     avg_cost = (red_cost + blue_cost) / 2
-                    # 成本越低（越接近连接），复杂度越高
-                    connectivity_complexity = max(0.0, 1.0 - avg_cost / board.size) * 0.3
-            except:
-                pass  # 如果无法计算，忽略
+                    connectivity_complexity = max(0.0, 1.0 - avg_cost / size) * 0.3
+            except Exception:
+                connectivity_complexity = 0.0
         
-        # 5. 综合复杂度计算
-        # 空位因子（0-1）
+        # 5. 结构复杂度
+        structural_complexity = self._calculate_structural_complexity(board)
+        # 空位因子：0~1，空越多，复杂度越高
         empty_factor = empty_ratio
-        
-        # 威胁因子（0-1，威胁越多越复杂）
-        threat_factor = min(1.0, threat_count / 5.0)  # 假设最多5个威胁
-        
-        # 综合复杂度
+        # 威胁因子：0~1，假设超过5个就视作 很多
+        threat_factor = min(1.0, threat_count / 5.0)
+        # phase_factor >1表示偏复杂，<1表示偏简单，这里用(phase_factor-0.7)/0.5粗略折算到0-1
+        phase_component = (phase_factor - 0.7) / 0.5
+        phase_component = max(0.0, min(1.0, phase_component))
+        # 综合复杂度（权重总和约为1）
         complexity = (
-            empty_factor * 0.5 +           # 空位权重50%
-            threat_factor * 0.3 +          # 威胁权重30%
-            connectivity_complexity +       # 连接性复杂度权重20%
-            (1.0 - phase_factor) * 0.2     # 游戏阶段权重20%
+                empty_factor * 0.30 +  # 空位30%
+                threat_factor * 0.25 +  # 威胁25%
+                connectivity_complexity * 0.20 +  # 连通性20%
+                structural_complexity * 0.15 +  # 结构复杂度15%
+                phase_component * 0.10  # 阶段因子10%
         )
-        
-        # 归一化到[0, 1]
+        # 归一化到[0,1]
         normalized_complexity = max(0.0, min(1.0, complexity))
-        
         return normalized_complexity
     
     def assess_position_criticality(self, board: Board, threat_detector=None, opp_colour=None) -> float:
@@ -165,7 +231,6 @@ class TimeManager:
         # 使用连接性评估来判断是否接近胜利/失败
         try:
             from .connectivity_evaluator import ConnectivityEvaluator
-            from src.Colour import Colour
             evaluator = ConnectivityEvaluator()
             
             # 计算双方的连接成本
@@ -180,15 +245,14 @@ class TimeManager:
         except:
             pass  # 如果无法计算，忽略
         
-        # 3. 检查游戏阶段
+        # 3. 后期提高关键性
         empty_tiles = sum(
-            1 for x in range(board.size) 
-            for y in range(board.size) 
+            1 for x in range(board.size)
+            for y in range(board.size)
             if board.tiles[x][y].colour is None
         )
         total_tiles = board.size * board.size
         empty_ratio = empty_tiles / total_tiles if total_tiles > 0 else 0.5
-        
         # 后期（空位<30%）：更关键，需要更仔细
         if empty_ratio < 0.3:
             return 1.2  # 后期：稍微提高关键性
@@ -231,8 +295,8 @@ class TimeManager:
         
         # 优化：动态复杂度因子（根据游戏阶段调整）
         empty_tiles = sum(
-            1 for x in range(board.size) 
-            for y in range(board.size) 
+            1 for x in range(board.size)
+            for y in range(board.size)
             if board.tiles[x][y].colour is None
         )
         total_tiles = board.size * board.size
