@@ -3,7 +3,6 @@
 """
 import time
 from typing import Optional
-
 from src.Board import Board
 from src.Colour import Colour
 from src.Tile import Tile

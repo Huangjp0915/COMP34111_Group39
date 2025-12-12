@@ -2,7 +2,6 @@
 Group39 Hex AI Agent - 主代理类
 """
 # import copy
-
 from src.AgentBase import AgentBase
 from src.Board import Board
 from src.Colour import Colour
