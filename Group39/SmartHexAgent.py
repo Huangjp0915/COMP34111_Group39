@@ -1,7 +1,7 @@
 """
 Group39 Hex AI Agent - 主代理类
 """
-import copy
+# import copy
 
 from src.AgentBase import AgentBase
 from src.Board import Board
@@ -46,18 +46,85 @@ class SmartHexAgent(AgentBase):
 
     def _find_winning_move_by_simulation(self, board: Board, colour: Colour) -> Optional[Move]:
         """
-        暴力检查：是否存在“一步即胜”的落子。
-        对每个空位尝试落子，调用 has_ended 判断是否立刻获胜。
+        快速检查：是否存在“一步即胜”的落子。
+        优化点：
+        - 不使用 deepcopy
+        - 只在“高度相关”的候选空位里检查（速度更稳）
         """
+        candidates = self._get_forced_check_candidates(board, colour)
+        for x, y in candidates:
+            if board.tiles[x][y].colour is not None:
+                continue
+            if self._try_place_and_check_win(board, x, y, colour):
+                return Move(x, y)
+        return None
+
+    def _try_place_and_check_win(self, board: Board, x: int, y: int, colour: Colour) -> bool:
+        """临时落子 -> has_ended -> 还原（避免 deepcopy）"""
+        original = board.tiles[x][y].colour
+        board.tiles[x][y].colour = colour
+        try:
+            return board.has_ended(colour)
+        finally:
+            board.tiles[x][y].colour = original
+
+    def _get_forced_check_candidates(self, board: Board, colour: Colour) -> list[tuple[int, int]]:
+        """
+        给“一步胜/一步防”专用的候选点集合：
+        - 所有空位中，优先取：靠近己方棋/靠近对手棋/靠近目标边 的点
+        目的：把 121 个点缩到常见 20~50 个以内。
+        """
+        from src.Tile import Tile
+
         size = board.size
+        cand = set()
+
+        # 1) 所有已落子周围的空位（双方都算）
         for x in range(size):
             for y in range(size):
                 if board.tiles[x][y].colour is None:
-                    test_board = copy.deepcopy(board)
-                    test_board.set_tile_colour(x, y, colour)
-                    if test_board.has_ended(colour):
-                        return Move(x, y)
-        return None
+                    continue
+                for i in range(Tile.NEIGHBOUR_COUNT):
+                    nx = x + Tile.I_DISPLACEMENTS[i]
+                    ny = y + Tile.J_DISPLACEMENTS[i]
+                    if 0 <= nx < size and 0 <= ny < size and board.tiles[nx][ny].colour is None:
+                        cand.add((nx, ny))
+
+        # 2) 靠近自己要连接的两条边（Red: top/bottom; Blue: left/right）
+        edge_band = 2  # 边缘附近的“带宽”，越大越慢；2 一般够用
+        if colour == Colour.RED:
+            for y in range(size):
+                for x in range(0, min(edge_band, size)):
+                    if board.tiles[x][y].colour is None:
+                        cand.add((x, y))
+                for x in range(max(0, size - edge_band), size):
+                    if board.tiles[x][y].colour is None:
+                        cand.add((x, y))
+        else:
+            for x in range(size):
+                for y in range(0, min(edge_band, size)):
+                    if board.tiles[x][y].colour is None:
+                        cand.add((x, y))
+                for y in range(max(0, size - edge_band), size):
+                    if board.tiles[x][y].colour is None:
+                        cand.add((x, y))
+
+        # 3) 如果棋盘几乎空（前几手），补一点中心附近，避免“候选集太偏边”
+        empties = 0
+        for x in range(size):
+            for y in range(size):
+                if board.tiles[x][y].colour is None:
+                    empties += 1
+        if empties >= size * size - 6:
+            cx = size // 2
+            cy = size // 2
+            radius = 2
+            for x in range(max(0, cx - radius), min(size, cx + radius + 1)):
+                for y in range(max(0, cy - radius), min(size, cy + radius + 1)):
+                    if board.tiles[x][y].colour is None:
+                        cand.add((x, y))
+
+        return list(cand)
 
     def _check_priority_moves(self, board: Board) -> Optional[Move]:
         """
@@ -98,6 +165,22 @@ class SmartHexAgent(AgentBase):
                     return False
         return True
 
+    def _sync_modules_colour_if_needed(self):
+        """
+        确保在发生 swap（无论是谁 swap）后，
+        所有子模块的 colour 与 self.colour 保持一致，并清理 MCTS 根状态，
+        这样不会依赖“swap是谁做的”，更稳妥些（吧？）
+        """
+        if getattr(self.mcts_engine, "colour", None) != self.colour:
+            self.mcts_engine.colour = self.colour
+            self.threat_detector.colour = self.colour
+            self.pattern_recognizer.colour = self.colour
+
+            # 换色后：MCTS 根与 last_move/board_hash 都必须清空
+            self.mcts_engine.root_node = None
+            self.mcts_engine.last_move = None
+            self.mcts_engine.last_board_hash = None
+
     def make_move(self, turn: int, board: Board, opp_move: Optional[Move]) -> Move:
         """
         主决策函数
@@ -118,28 +201,12 @@ class SmartHexAgent(AgentBase):
             if remaining_time < 0.05:
                 return self._get_quick_move(board)
 
-            # 0.5 开局特判：如果是第一手并且棋盘是空的，直接下中心
-            if turn == 1 and self._is_board_empty(board):
-                size = board.size
-                center = size // 2
-                move = Move(center, center)
-                # 保险起见再检查一下合法性
-                if self._is_valid_move(move, board):
-                    self.last_move = move
-                    return move
-            
-            # 1. 处理对手的交换（如果对手在turn==2交换了，游戏引擎会自动改变我们的颜色）
-            # 但我们需要更新has_swapped状态
+            self._sync_modules_colour_if_needed()  #触发一下 swap 同步函数保险机制
+
+            # 1. 对手在 turn==2 选择 swap：这里只做状态标记。
+            # 模块 colour 同步与 MCTS 清理由 _sync_modules_colour_if_needed() 统一处理。
             if opp_move and opp_move.is_swap():
                 self.has_swapped = True
-                # 游戏引擎已经改变了我们的颜色，但我们需要更新所有模块
-                self.mcts_engine.colour = self.colour
-                self.threat_detector.colour = self.colour
-                self.pattern_recognizer.colour = self.colour
-                # 重置MCTS根节点和状态（因为颜色改变了，棋盘状态也改变了）
-                self.mcts_engine.root_node = None
-                self.mcts_engine.last_move = None
-                self.mcts_engine.last_board_hash = None
             
             # 2. 交换决策（第二回合，且对手没有交换）
             if turn == 2 and not self.has_swapped and (not opp_move or not opp_move.is_swap()):
@@ -167,9 +234,12 @@ class SmartHexAgent(AgentBase):
             if priority_move is not None:
                 return priority_move
 
-            # 3.3 如果这是我在本局的第一颗棋子，无论先后手，都优先靠近中心落子
+            # 3.3 如果这是我在本局的第一颗棋子
             if self._is_my_first_move(board):
-                move = self._get_first_valid_move(board)
+                if turn == 1 and self._is_board_empty(board):
+                    move = self._get_balanced_first_move(board)  # 避免被swap白嫖
+                else:
+                    move = self._get_center_biased_opening_reply(board)
                 if self._is_valid_move(move, board):
                     self.last_move = move
                     return move
@@ -237,44 +307,44 @@ class SmartHexAgent(AgentBase):
     
     def _decide_swap(self, board: Board, opp_move: Optional[Move]) -> Move:
         """
-        第二回合的交换决策
-        使用连接性评估判断是否交换
-        
-        Args:
-            board: 当前棋盘状态
-            opp_move: 对手的第一手走法
-        
-        Returns:
-            Move: 交换(-1, -1)或正常走法
+        第二回合的交换决策（swap-rule / pie rule）。
+        只在 turn==2 被调用时有效。
+        逻辑：对手第一手越靠近中心，越值得 swap。
+        先用非常稳的启发式（几乎不耗时），后续我们再升级为“平衡开局/强开局判断”。
         """
         if self.has_swapped:
-            # 已经交换过，不能再交换
             return self._get_first_valid_move(board)
-        
-        try:
-            # 使用连接性评估判断是否交换
+        if opp_move is None or opp_move.is_swap():
+            return self._get_first_valid_move(board)
+
+        size = board.size
+        cx = size // 2
+        cy = size // 2
+        x, y = opp_move.x, opp_move.y
+
+        dist = abs(x - cx) + abs(y - cy)  # 越靠中心越强（经验启发）
+
+        # 阈值：11x11 用 2~3 一般都算“很强”
+        # dist <= 2：强烈建议 swap
+        if dist <= 2:
+            self.has_swapped = True
+            logger.info(f"Agent decided to SWAP (opp opening near center, dist={dist})")
+            return Move(-1, -1)
+
+        # dist == 3：看一个轻量的连通启发（不做深搜索）
+        if dist == 3:
             red_cost = self.connectivity_evaluator.shortest_path_cost(board, Colour.RED)
             blue_cost = self.connectivity_evaluator.shortest_path_cost(board, Colour.BLUE)
-            
-            if self.colour == Colour.RED:
-                # RED的视角：如果BLUE成本更低，应该交换
-                my_advantage = blue_cost - red_cost
-            else:
-                # BLUE的视角：如果RED成本更低，应该交换
-                my_advantage = red_cost - blue_cost
-            
-            # 如果对手位置更有利（advantage < 0），交换
-            if my_advantage < 0:
-                self.has_swapped = True
-                logger.info("Agent decided to SWAP")
-                return Move(-1, -1)  # 交换
-            else:
-                # 不交换，正常走法
-                return self._get_first_valid_move(board)
-        except Exception as e:
-            logger.error(f"Error in swap decision: {e}")
-            # 出错时默认不交换
-            return self._get_first_valid_move(board)
+
+            # 若当前局面对“先手颜色”明显更好，则 swap
+            # （turn==2 是后手，swap 就是拿走对手的）
+            if red_cost != float("inf") and blue_cost != float("inf"):
+                if (red_cost - blue_cost) < -0.3:  # 红更接近连通 说明先手偏强
+                    self.has_swapped = True
+                    logger.info("Agent decided to SWAP (heuristic cost check)")
+                    return Move(-1, -1)
+
+        return self._get_first_valid_move(board)
     
     def _get_fallback_move(self, board: Board) -> Move:
         """
@@ -352,6 +422,106 @@ class SmartHexAgent(AgentBase):
             logger.error(f"Error in quick move: {e}")
             return self._get_first_valid_move(board)
 
+    def _get_balanced_first_move(self, board: Board) -> Move:
+        """
+        有 swap 规则时的先手第一步：追求“平衡”，避免对手爽swap。
+        - 仍然偏中心（太边会弱）
+        - 但避免“正中心/紧贴中心”这种明显强开局
+        - 用一个轻量指标：落子后 red_cost 与 blue_cost 的差距尽量小（更“平衡”）
+        """
+        size = board.size
+        cx = size // 2
+        cy = size // 2
+
+        best = None
+        best_score = float("inf")
+
+        radius = 4  # 兼顾速度
+
+        for x in range(max(0, cx - radius), min(size, cx + radius + 1)):
+            for y in range(max(0, cy - radius), min(size, cy + radius + 1)):
+                if board.tiles[x][y].colour is not None:
+                    continue
+
+                center_dist = abs(x - cx) + abs(y - cy)
+
+                # 避免“太明显强”的点：正中心或紧贴中心
+                strong_penalty = 0.0
+                if center_dist <= 1:
+                    strong_penalty = 2.0
+
+                original = board.tiles[x][y].colour
+                board.tiles[x][y].colour = self.colour
+                try:
+                    red_cost = self.connectivity_evaluator.shortest_path_cost(board, Colour.RED)
+                    blue_cost = self.connectivity_evaluator.shortest_path_cost(board, Colour.BLUE)
+                finally:
+                    board.tiles[x][y].colour = original
+
+                # 处理 inf
+                if red_cost == float("inf") or blue_cost == float("inf"):
+                    balance = 10.0
+                else:
+                    balance = abs(red_cost - blue_cost)
+
+                # score 越小越好：更平衡 + 不太离谱地偏中心 + 不给对手明显swap理由
+                score = 3.0 * balance + 0.20 * center_dist + strong_penalty
+
+                if score < best_score:
+                    best_score = score
+                    best = (x, y)
+
+        if best is None:
+            return Move(cx, cy)  # 极端兜底
+        return Move(best[0], best[1])
+
+    def _get_center_biased_opening_reply(self, board: Board) -> Move:
+        """
+        用于“我在本局第一颗棋子”的开局/换色后第一手：
+        - 明确偏好中心区域
+        - 同时轻微考虑连通成本（别光图中心）
+        """
+        size = board.size
+        cx = size // 2
+        cy = size // 2
+
+        best = None
+        best_score = float("inf")
+
+        # 只扫一个中心菱形区域（半径 3），非常快
+        radius = 3
+        for x in range(max(0, cx - radius), min(size, cx + radius + 1)):
+            for y in range(max(0, cy - radius), min(size, cy + radius + 1)):
+                if board.tiles[x][y].colour is not None:
+                    continue
+
+                # score 越小越好：中心距离 + 轻量连通启发
+                center_dist = abs(x - cx) + abs(y - cy)
+
+                # 临时落子评估：我方路径成本下降越多越好
+                before = self.connectivity_evaluator.shortest_path_cost(board, self.colour)
+                original = board.tiles[x][y].colour
+                board.tiles[x][y].colour = self.colour
+                try:
+                    after = self.connectivity_evaluator.shortest_path_cost(board, self.colour)
+                finally:
+                    board.tiles[x][y].colour = original
+
+                improve = 0.0
+                if before != float("inf") and after != float("inf"):
+                    improve = before - after
+
+                score = center_dist - 0.6 * improve  # 0.6 是温和权重（先别太激进）
+                if score < best_score:
+                    best_score = score
+                    best = (x, y)
+
+        if best is not None:
+            return Move(best[0], best[1])
+
+        # 兜底：用你已有的中心距离排序
+        return self._get_first_valid_move(board)
+
     def _get_first_valid_move(self, board: Board) -> Move:
         """
         返回一个“相对合理”的合法走法：
@@ -412,4 +582,3 @@ class SmartHexAgent(AgentBase):
             if board.tiles[x][y].colour is None
         )
         return max(1, empty_tiles // 2)  # 粗略估算
-
