@@ -419,7 +419,7 @@ class SmartHexAgent(AgentBase):
                         if alt and self._is_valid_move(alt, board):
                             move = alt
 
-                # 再做 tension gating（对最终 move 做检查，避免漏检）
+                # 再做 tension gating（对最终 move 做检查）
                 if candidates is None:
                     candidates = []
 

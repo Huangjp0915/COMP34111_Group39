@@ -106,6 +106,72 @@ class TimeManager:
         elapsed = time.time() - self.start_time
         remaining = self.total_time_limit - elapsed
         return max(0.0, remaining)
+
+    def _opposite_colour(self, c: Colour) -> Colour:
+        return Colour.BLUE if c == Colour.RED else Colour.RED
+
+    def assess_position_tension(self, board: Board, threat_detector=None, opp_colour=None) -> float:
+        """
+        评估“局面紧张度”（0~1）：
+        - 越接近胜负越紧张（任意一方快连上了）
+        - 双方连接成本差距越大越紧张（局面偏向一方）
+        - 立即威胁（必杀/必防）越多越紧张
+
+        只是判断该不该多花时间想，不用于选点
+        """
+        if threat_detector is None or opp_colour is None:
+            return 0.0
+
+        my_colour = self._opposite_colour(opp_colour)
+
+        # 1) 立即威胁（双方都测一下，更稳）
+        opp_threats = []
+        my_threats = []
+        try:
+            opp_threats = threat_detector.detect_immediate_threats(board, opp_colour) or []
+        except Exception:
+            opp_threats = []
+        try:
+            my_threats = threat_detector.detect_immediate_threats(board, my_colour) or []
+        except Exception:
+            my_threats = []
+
+        # threat_severity: 0~1
+        # 有 WIN / LOSE 这种级别，直接拉满（因为你主代理里会规则层优先处理，但 TimeManager 需要知道“这回合很关键”）
+        severe = 0
+        for t in (opp_threats + my_threats):
+            if len(t) >= 3 and (t[2] == "WIN" or t[2] == "LOSE"):
+                severe += 1
+        threat_severity = 1.0 if severe > 0 else min(1.0, (len(opp_threats) + len(my_threats)) / 4.0)
+
+        # 2) 连接成本（接近连通越紧张；差距越大越紧张）
+        closeness = 0.0
+        gap = 0.0
+        try:
+            from .connectivity_evaluator import ConnectivityEvaluator
+            ev = ConnectivityEvaluator()
+            red_cost = ev.shortest_path_cost(board, Colour.RED)
+            blue_cost = ev.shortest_path_cost(board, Colour.BLUE)
+
+            # closeness：任意一方 cost 很低 -> 紧张
+            finite_costs = [c for c in (red_cost, blue_cost) if c != float("inf")]
+            if finite_costs:
+                min_cost = min(finite_costs)
+                # min_cost 越小越紧张；用 size 归一化
+                closeness = max(0.0, min(1.0, 1.0 - (min_cost / max(1, board.size))))
+            # gap：局面倾斜越大 -> 紧张（避免被碾/避免浪费时间）
+            if red_cost != float("inf") and blue_cost != float("inf"):
+                gap = max(0.0, min(1.0, abs(red_cost - blue_cost) / max(1, board.size)))
+        except Exception:
+            pass
+
+        # 3) 综合（权重可解释且可调）
+        tension = (
+            0.45 * threat_severity +   # 有必杀必防时：最紧张
+            0.35 * closeness +         # 接近终局时：更紧张
+            0.20 * gap                 # 局面明显倾斜：也要更谨慎
+        )
+        return max(0.0, min(1.0, tension))
     
     def assess_position_complexity(self, board: Board, threat_detector=None, opp_colour=None) -> float:
         """
@@ -159,17 +225,17 @@ class TimeManager:
         
         # 4. 连接性复杂度（双方连接成本差异）
         connectivity_complexity = 0.0
-        if threat_detector:
-            try:
-                from .connectivity_evaluator import ConnectivityEvaluator
-                evaluator = ConnectivityEvaluator()
-                red_cost = evaluator.shortest_path_cost(board, Colour.RED)
-                blue_cost = evaluator.shortest_path_cost(board, Colour.BLUE)
-                if red_cost != float("inf") and blue_cost != float("inf"):
-                    avg_cost = (red_cost + blue_cost) / 2
-                    connectivity_complexity = max(0.0, 1.0 - avg_cost / size) * 0.3
-            except Exception:
-                connectivity_complexity = 0.0
+        try:
+            from .connectivity_evaluator import ConnectivityEvaluator
+            evaluator = ConnectivityEvaluator()
+            red_cost = evaluator.shortest_path_cost(board, Colour.RED)
+            blue_cost = evaluator.shortest_path_cost(board, Colour.BLUE)
+
+            if red_cost != float("inf") and blue_cost != float("inf"):
+                avg_cost = (red_cost + blue_cost) / 2.0
+                connectivity_complexity = max(0.0, min(1.0, 1.0 - avg_cost / max(1, size)))
+        except Exception:
+            connectivity_complexity = 0.0
         
         # 5. 结构复杂度
         structural_complexity = self._calculate_structural_complexity(board)
@@ -210,21 +276,25 @@ class TimeManager:
         Returns:
             float: 关键性因子（1.0=正常，2.5=最高关键性）
         """
+
+        immediate_threats = []  # 避免未定义
+
         # 1. 检查immediate threats（最高优先级）
         if threat_detector and opp_colour:
-            immediate_threats = threat_detector.detect_immediate_threats(
-                board, opp_colour
-            )
-            if immediate_threats:
-                # 检查是否有WIN威胁（立即获胜，最高优先级）
-                win_threats = [t for t in immediate_threats if t[2] == "WIN"]
-                if win_threats:
-                    return 2.5  # 最高关键性，需要更多时间确保正确
-                
-                # 检查是否有LOSE威胁（必须阻止）
-                lose_threats = [t for t in immediate_threats if t[2] == "LOSE"]
-                if lose_threats:
-                    return 2.0  # 高关键性，需要加倍时间
+            try:
+                immediate_threats = threat_detector.detect_immediate_threats(board, opp_colour) or []
+            except Exception:
+                immediate_threats = []
+
+        if immediate_threats:
+            # 检查是否有WIN威胁（立即获胜，最高优先级）
+            win_threats = [t for t in immediate_threats if len(t) >= 3 and t[2] == "WIN"]
+            if win_threats:
+                return 2.5  # 最高关键性，需要更多时间确保正确
+            # 检查是否有LOSE威胁（必须阻止）
+            lose_threats = [t for t in immediate_threats if len(t) >= 3 and t[2] == "LOSE"]
+            if lose_threats:
+                return 2.0  # 高关键性，需要加倍时间
         
         # 2. 检查接近胜利/失败的情况
         # 使用连接性评估来判断是否接近胜利/失败
@@ -235,14 +305,20 @@ class TimeManager:
             # 计算双方的连接成本
             red_cost = evaluator.shortest_path_cost(board, Colour.RED)
             blue_cost = evaluator.shortest_path_cost(board, Colour.BLUE)
-            
-            # 如果一方非常接近连接（cost <= 2），关键性提高
-            if red_cost != float('inf') and red_cost <= 2:
-                return 1.5  # 接近胜利，中等关键性
-            if blue_cost != float('inf') and blue_cost <= 2:
-                return 1.5  # 接近失败，中等关键性
-        except:
-            pass  # 如果无法计算，忽略
+
+            # 用 opp_colour 区分：对手快连上更危险 -> 更关键
+            if opp_colour is not None:
+                my_colour = self._opposite_colour(opp_colour)
+
+                opp_cost = red_cost if opp_colour == Colour.RED else blue_cost
+                my_cost = red_cost if my_colour == Colour.RED else blue_cost
+
+                if opp_cost != float("inf") and opp_cost <= 2:
+                    return 1.6  # 对手快赢：更关键
+                if my_cost != float("inf") and my_cost <= 2:
+                    return 1.4  # 我快赢：也关键，但稍低一点
+        except Exception:
+            pass
         
         # 3. 后期提高关键性
         empty_tiles = sum(
@@ -263,97 +339,75 @@ class TimeManager:
                       total_turns_remaining: int, threat_detector=None, 
                       opp_colour=None) -> float:
         """
-        智能分配时间
-        
-        优化：更精确的时间分配，减少时间浪费
-        - 动态调整复杂度因子
-        - 根据游戏阶段调整时间分配
-        - 更智能的安全缓冲
-        
-        Args:
-            board: 当前棋盘状态
-            total_time_remaining: 剩余总时间
-            total_turns_remaining: 剩余回合数
-            threat_detector: 威胁检测器（可选）
-            opp_colour: 对手颜色（可选）
-        
-        Returns:
-            float: 分配的时间预算（秒）
+        base_time（均分） * stage_factor（中后盘更愿意花时间）
+                            * (1 + a*complexity + b*tension) * criticality
+        然后再做安全缓冲 + 上下限裁剪。
         """
         # 基础时间 = 剩余时间 / 剩余回合数
         if total_turns_remaining <= 0:
             total_turns_remaining = 1  # 防止除零
-        
+
+        A_COMPLEXITY = 0.55  # 复杂度影响
+        B_TENSION = 0.85  # 紧张度影响（比复杂度更“值”）
+        # stage_factor：早期<1，中期≈1，后期>1
+        STAGE_EARLY = 0.85
+        STAGE_MID = 1.00
+        STAGE_LATE = 1.20
+
+        # 安全缓冲（越缺时间越保守）
+        BUFFER_RICH = 0.95  # >60s
+        BUFFER_MID = 0.90  # 30~60s
+        BUFFER_LOW = 0.82  # <30s
+
+        MAX_SINGLE_SEARCH_TIME = 10.0  # 单次不超过10s（防止一把梭哈）
+
         base_time = total_time_remaining / total_turns_remaining
-        
-        # 评估复杂度和关键性
-        complexity = self.assess_position_complexity(board, threat_detector, opp_colour)
-        criticality = self.assess_position_criticality(
-            board, threat_detector, opp_colour
-        )
-        
-        # 优化：动态复杂度因子（根据游戏阶段调整）
+
+        # 游戏阶段（用空位比例判断）
+        size = board.size
+        total_tiles = size * size
         empty_tiles = sum(
-            1 for x in range(board.size)
-            for y in range(board.size)
+            1 for x in range(size)
+            for y in range(size)
             if board.tiles[x][y].colour is None
         )
-        total_tiles = board.size * board.size
         empty_ratio = empty_tiles / total_tiles if total_tiles > 0 else 0.5
-        
-        # 早期：复杂度影响较小（选择多，但不需要太深入）
-        # 后期：复杂度影响较大（选择少，但需要更仔细）
-        if empty_ratio > 0.7:
-            # 早期：复杂度因子较小（0.3倍）
-            complexity_factor = 1.0 + complexity * 0.3
-        elif empty_ratio < 0.3:
-            # 后期：复杂度因子较大（0.8倍）
-            complexity_factor = 1.0 + complexity * 0.8
+
+        if empty_ratio > 0.70:
+            stage_factor = STAGE_EARLY
+            max_time_ratio = 0.25
+        elif empty_ratio < 0.30:
+            stage_factor = STAGE_LATE
+            max_time_ratio = 0.50
         else:
-            # 中期：正常复杂度因子（0.5倍）
-            complexity_factor = 1.0 + complexity * 0.5
-        
-        # 关键性因子（遇到威胁时增加时间）
-        time_budget = base_time * complexity_factor * criticality
-        
-        # 优化：动态安全缓冲（根据剩余时间调整）
-        # 如果剩余时间充足，可以预留更多缓冲
-        # 如果剩余时间紧张，减少缓冲
+            stage_factor = STAGE_MID
+            max_time_ratio = 0.35
+
+        complexity = self.assess_position_complexity(board, threat_detector, opp_colour)
+        criticality = self.assess_position_criticality(board, threat_detector, opp_colour)
+        tension = self.assess_position_tension(board, threat_detector, opp_colour)
+
+        # 主公式：解释性强、参数可调
+        multiplier = stage_factor * (1.0 + A_COMPLEXITY * complexity + B_TENSION * tension)
+        time_budget = base_time * multiplier * criticality
+
+        # 安全缓冲
         if total_time_remaining > 60.0:
-            # 时间充足：预留15%缓冲
-            safety_buffer = 0.85
+            time_budget *= BUFFER_RICH
         elif total_time_remaining > 30.0:
-            # 时间中等：预留10%缓冲
-            safety_buffer = 0.9
+            time_budget *= BUFFER_MID
         else:
-            # 时间紧张：预留5%缓冲
-            safety_buffer = 0.95
-        
-        time_budget = time_budget * safety_buffer
-        
-        # 优化：更智能的时间上限
-        # 根据剩余回合数调整上限
-        if total_turns_remaining > 20:
-            # 还有很多回合：最多使用剩余时间的60%
-            max_time_ratio = 0.6
-        elif total_turns_remaining > 10:
-            # 中等回合数：最多使用剩余时间的70%
-            max_time_ratio = 0.7
-        else:
-            # 接近结束：最多使用剩余时间的80%
-            max_time_ratio = 0.8
-        
+            time_budget *= BUFFER_LOW
+
+        # 上限：不能超过剩余时间的一定比例
         time_budget = min(time_budget, total_time_remaining * max_time_ratio)
-        
-        # 优化：最小时间保证（根据复杂度调整）
-        # 复杂局面需要更多时间
-        min_time = 0.01 + complexity * 0.05  # 最小0.01秒，最多0.06秒
+
+        # 下限：复杂/紧张局面至少给一点像样的时间
+        min_time = 0.012 + 0.040 * tension + 0.020 * complexity  # 大概 0.012~0.072
         time_budget = max(time_budget, min_time)
-        
-        # 优化：最大时间限制（避免单次搜索时间过长）
-        # 即使很复杂，单次搜索也不应该超过10秒
-        max_single_search_time = 10.0
-        time_budget = min(time_budget, max_single_search_time)
+
+        # 绝对上限
+        time_budget = min(time_budget, MAX_SINGLE_SEARCH_TIME)
         
         return time_budget
     
@@ -369,4 +423,3 @@ class TimeManager:
         """
         kills = []
         return kills
-
