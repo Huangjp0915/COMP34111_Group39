@@ -358,14 +358,12 @@ class SmartHexAgent(AgentBase):
             60 是一个“够用但不爆炸”的经验值（你也可以调参）。
             """
             cand = set(self._generate_local_candidates(b, player, k_limit=k_limit))
-            cand.update(self._generate_local_candidates(
-                b, Colour.BLUE if player == Colour.RED else Colour.RED, k_limit=k_limit
-            ))
+            cand.update(self._generate_local_candidates(b, Colour.BLUE if player == Colour.RED else Colour.RED,
+                                                        k_limit=k_limit))
 
             base_my = self.connectivity_evaluator.shortest_path_cost(b, player)
-            base_opp = self.connectivity_evaluator.shortest_path_cost(
-                b, Colour.BLUE if player == Colour.RED else Colour.RED
-            )
+            base_opp = self.connectivity_evaluator.shortest_path_cost(b,
+                                                                      Colour.BLUE if player == Colour.RED else Colour.RED)
 
             best_mv, best_sc = None, -1e18
             for x, y in cand:
@@ -373,12 +371,9 @@ class SmartHexAgent(AgentBase):
                     continue
                 b2 = copy.deepcopy(b)
                 b2.set_tile_colour(x, y, player)
-
                 new_my = self.connectivity_evaluator.shortest_path_cost(b2, player)
-                new_opp = self.connectivity_evaluator.shortest_path_cost(
-                    b2, Colour.BLUE if player == Colour.RED else Colour.RED
-                )
-
+                new_opp = self.connectivity_evaluator.shortest_path_cost(b2,
+                                                                         Colour.BLUE if player == Colour.RED else Colour.RED)
                 # sc 越大说明这步越能“让对手更难 + 让自己更易”
                 # 0.6 是一个权重：更强调“别把自己走坏”
                 sc = (new_opp - base_opp) - 0.6 * (new_my - base_my)
@@ -447,7 +442,8 @@ class SmartHexAgent(AgentBase):
         temp = 0.35
         weights = [pow(2.71828, (s - top[0][0]) / temp) for s, _, _ in top]
 
-        _, bx, by = random.choices(top, weights=weights, k=1)[0]
+        pick = random.choices(top, weights=weights, k=1)[0]
+        _, bx, by = pick
         return Move(bx, by)
 
 
@@ -669,6 +665,15 @@ class SmartHexAgent(AgentBase):
 
             # (1) 第一手开局：使用“抗swap+抗回应”的开局点（并且带软随机）
             if turn == 1:
+                empty = True
+                for x in range(board.size):
+                    for y in range(board.size):
+                        if board.tiles[x][y].colour is not None:
+                            empty = False
+                            break
+                    if not empty:
+                        break
+
                 return self._choose_balanced_opening(board)
 
             # (2) 如果对手刚刚 swap：引擎会改 self.colour，但我们要同步所有模块
@@ -693,7 +698,9 @@ class SmartHexAgent(AgentBase):
                 return swap_move
 
             # (4) ThreatDetector：优先级高于 MCTS（战术点不能错）
-            immediate_threats = self.threat_detector.detect_immediate_threats(board, self.opp_colour())
+            immediate_threats = self.threat_detector.detect_immediate_threats(
+                board, self.opp_colour()
+            )
             for x, y, threat_type in immediate_threats:
                 if threat_type == "WIN":
                     return Move(x, y)
@@ -704,45 +711,126 @@ class SmartHexAgent(AgentBase):
             priority_move = self._check_priority_moves(board)
             if priority_move is not None:
                 return priority_move
+            if self._is_my_first_move(board):
+                move = self._get_first_valid_move(board)
+                if self._is_valid_move(move, board):
+                    self.last_move = move
+                    return move
 
             # (6) 防守补丁：对手太顺先挡一手
             defensive = self._choose_defensive_block(board)
             if defensive is not None:
                 return defensive
 
-            # (7) 正常走：时间分配 -> MCTS
-            total_turns_remaining = self._estimate_remaining_turns(board)
-            time_budget = self.time_manager.allocate_time(
-                board, remaining_time, total_turns_remaining, self.threat_detector, self.opp_colour()
-            )
+            # (7) 时间分配
+                total_turns_remaining = self._estimate_remaining_turns(board)
+                time_budget = self.time_manager.allocate_time(
+                    board,
+                    remaining_time,
+                    total_turns_remaining,
+                    self.threat_detector,
+                    self.opp_colour()
+                )
 
-            # 根节点复用依赖 opp_move：对手正常落子才有意义
-            if opp_move and not opp_move.is_swap():
-                self.mcts_engine.last_move = opp_move
-            else:
-                self.mcts_engine.last_move = None
-                self.mcts_engine.root_node = None
-                self.mcts_engine.last_board_hash = None
+            # (8) MCTS 搜索
+            try:
+                # 更新MCTS引擎的last_move（用于根节点复用）
+                if opp_move and not opp_move.is_swap():
+                    self.mcts_engine.last_move = opp_move
+                else:
+                    # 如果对手交换了，重置last_move和根节点
+                    self.mcts_engine.last_move = None
+                    self.mcts_engine.root_node = None
+                    self.mcts_engine.last_board_hash = None
 
-            move = self.mcts_engine.search(board, time_budget)
+                move = self.mcts_engine.search(board, time_budget)
 
-            # (8) 合法性强制兜底：无论如何不能返回非法点
-            if not move or not self._is_valid_move(move, board):
+                # 三重验证走法合法性（确保万无一失）
+                if not move:
+                    logger.warning("MCTS returned None, using fallback")
+                    return self._get_fallback_move(board)
+
+                # 验证1：基本合法性
+                if not self._is_valid_move(move, board):
+                    logger.warning(f"MCTS returned invalid move {move}, using fallback")
+                    return self._get_fallback_move(board)
+
+                # 验证2：位置是否为空（防御性检查）
+                if move.x != -1 and move.y != -1:
+                    if board.tiles[move.x][move.y].colour is not None:
+                        logger.warning(f"MCTS returned move to occupied position ({move.x}, {move.y}), using fallback")
+                        return self._get_fallback_move(board)
+
+                # 验证3：坐标范围
+                if move.x != -1 and move.y != -1:
+                    if not (0 <= move.x < board.size and 0 <= move.y < board.size):
+                        logger.warning(f"MCTS returned move out of bounds ({move.x}, {move.y}), using fallback")
+                        return self._get_fallback_move(board)
+                # 轻量后处理：避免明显的“没头苍蝇乱下”
+                move = self._postprocess_mcts_move(board, move)
+
+                # 再做一次最基本合法性检查
+                if not self._is_valid_move(move, board):
+                    logger.warning(f"Postprocess produced invalid move {move}, using fallback")
+                    return self._get_fallback_move(board)
+
+                # 所有验证通过
+                self.last_move = move
+                return move
+            except Exception as e:
+                logger.error(f"MCTS search failed: {e}")
+                import traceback
+                traceback.print_exc()
                 return self._get_fallback_move(board)
-
-            # (9) 后处理：只有“明显更好”才替换，避免瞎改破坏 MCTS
-            move = self._postprocess_mcts_move(board, move)
-            if not self._is_valid_move(move, board):
-                return self._get_fallback_move(board)
-
-            self.last_move = move
-            return move
 
         except Exception as e:
+            # 任何异常都返回一个合法走法
             logger.error(f"Error in make_move: {e}")
             import traceback
             traceback.print_exc()
             return self._get_fallback_move(board)
+
+    def _choose_balanced_opening_move(self, board: Board) -> Move:
+        """
+        空盘第一手：选择“中庸”的开局点（让局面对双方尽量平衡）
+        做法：只看中心附近一圈候选点，模拟落子后用 shortest_path_cost 计算平衡度。
+        """
+        size = board.size
+        c = size // 2
+
+        # 候选：中心附近半径 r 的点（别全盘扫，太慢也没必要）
+        r = 2
+        candidates = []
+        for x in range(max(0, c - r), min(size, c + r + 1)):
+            for y in range(max(0, c - r), min(size, c + r + 1)):
+                if board.tiles[x][y].colour is None:
+                    candidates.append((x, y))
+
+        if not candidates:
+            return self._get_first_valid_move(board)
+
+        scored = []
+        for x, y in candidates:
+            b2 = copy.deepcopy(board)
+            b2.set_tile_colour(x, y, self.colour)
+
+            red_cost = self.connectivity_evaluator.shortest_path_cost(b2, Colour.RED)
+            blue_cost = self.connectivity_evaluator.shortest_path_cost(b2, Colour.BLUE)
+
+            # “中庸”指标：红蓝代价差越小越好（越平衡）
+            balance = abs(red_cost - blue_cost)
+
+            # 轻微偏好：离中心近一点（只是 tie-break，不是强制中心）
+            dist = abs(x - c) + abs(y - c)
+
+            scored.append((balance, dist, x, y))
+
+        scored.sort(key=lambda t: (t[0], t[1]))
+
+        # 从最好的前 K 个里随机选一个，避免套路固定
+        K = min(3, len(scored))
+        _, _, bx, by = random.choice(scored[:K])
+        return Move(bx, by)
 
 
     # ============================================================
@@ -882,30 +970,43 @@ class SmartHexAgent(AgentBase):
         3) 最后兜底：离中心最近的空位
         """
         try:
+            # 方法1：返回最近访问次数最多的子节点（如果有MCTS根节点）
+            # 但必须验证根节点状态与当前棋盘一致
             if self.mcts_engine.root_node:
+                # 验证根节点状态
                 from .utils import hash_board
                 root_hash = hash_board(self.mcts_engine.root_node.board)
                 current_hash = hash_board(board)
                 if root_hash == current_hash and self.mcts_engine.root_node.children:
-                    best_child = max(self.mcts_engine.root_node.children, key=lambda c: c.visits)
+                    best_child = max(
+                        self.mcts_engine.root_node.children,
+                        key=lambda c: c.visits
+                    )
                     if best_child.move and self._is_valid_move(best_child.move, board):
+                        # 再次验证位置是否为空
                         if best_child.move.x != -1 and best_child.move.y != -1:
                             if board.tiles[best_child.move.x][best_child.move.y].colour is None:
                                 return best_child.move
 
+            # 方法2：返回模式识别推荐的点
             patterns = self.pattern_recognizer.detect_simple_patterns(board, self.colour)
             if patterns:
+                # 按权重排序，选择权重最高的
                 patterns.sort(key=lambda p: p[2], reverse=True)
                 for x, y, _ in patterns:
                     move = Move(x, y)
-                    if self._is_valid_move(move, board) and board.tiles[x][y].colour is None:
-                        return move
+                    if self._is_valid_move(move, board):
+                        # 再次验证位置是否为空
+                        if board.tiles[x][y].colour is None:
+                            return move
 
+            # 方法3：返回第一个合法走法（最安全）
             return self._get_first_valid_move(board)
-
         except Exception as e:
             logger.error(f"Error in fallback move: {e}")
+            # 最后的备用方案
             return self._get_first_valid_move(board)
+
 
     def _get_quick_move(self, board: Board) -> Move:
         """
@@ -914,14 +1015,18 @@ class SmartHexAgent(AgentBase):
         - 否则下一个最简单的合法点
         """
         try:
-            immediate_threats = self.threat_detector.detect_immediate_threats(board, self.opp_colour())
+            # 只检查威胁，不进行MCTS搜索
+            immediate_threats = self.threat_detector.detect_immediate_threats(
+                board, self.opp_colour()
+            )
             if immediate_threats:
                 for x, y, threat_type in immediate_threats:
                     move = Move(x, y)
                     if self._is_valid_move(move, board):
                         return move
-            return self._get_first_valid_move(board)
 
+            # 如果没有威胁，返回第一个合法走法
+            return self._get_first_valid_move(board)
         except Exception as e:
             logger.error(f"Error in quick move: {e}")
             return self._get_first_valid_move(board)
@@ -958,7 +1063,7 @@ class SmartHexAgent(AgentBase):
         - 普通点：必须在棋盘内且为空
         """
         if move.x == -1 and move.y == -1:
-            return True
+            return True  # 交换走法
 
         if 0 <= move.x < board.size and 0 <= move.y < board.size:
             return board.tiles[move.x][move.y].colour is None
