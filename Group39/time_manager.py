@@ -22,7 +22,7 @@ class TimeManager:
     
     def __init__(self):
         self.start_time: Optional[float] = None
-        self.total_time_limit = 270.0  # 4分半（秒）
+        self.total_time_limit = 300
         self.used_time = 0.0
 
     def _count_connections(self, board: Board, colour: Colour) -> int:
