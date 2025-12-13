@@ -1,6 +1,6 @@
 """
 Group39 Hex AI Agent - 主代理类
-EH-v4.5 (带有极致详细的注释，注释由ChatGPT总结撰写)
+EH-v4.7
 """
 
 # ========================
@@ -160,6 +160,7 @@ EH-v4.5 (带有极致详细的注释，注释由ChatGPT总结撰写)
 #
 # ============================================================
 
+
 import copy
 import random
 
@@ -173,9 +174,9 @@ from .threat_detector import ThreatDetector
 from .connectivity_evaluator import ConnectivityEvaluator
 from .pattern_recognizer import PatternRecognizer
 from .time_manager import TimeManager
+# from .neural_evaluator import NeuralEvaluator
 from .utils import logger
 from typing import Optional
-
 
 class SmartHexAgent(AgentBase):
     """
@@ -190,21 +191,19 @@ class SmartHexAgent(AgentBase):
     def __init__(self, colour: Colour):
         super().__init__(colour)
 
-        # --- 模块初始化 ---
-        # 注意：colour 可能会因为 swap 改变，所以在处理 swap 时要同步更新模块里的 colour
+        # 初始化各个模块
         self.mcts_engine = MCTSEngine(colour)
         self.threat_detector = ThreatDetector(colour)
         self.connectivity_evaluator = ConnectivityEvaluator()
         self.pattern_recognizer = PatternRecognizer(colour)
-
         self.time_manager = TimeManager()
-        self.time_manager.start_timer()
+        self.time_manager.start_timer()  # 开始计时
+        # self.neural_evaluator = NeuralEvaluator(colour)
 
-        # --- 状态变量 ---
+        # 游戏状态跟踪
         self.last_move = None
         self.turn_count = 0
-        self.has_swapped = False   # 我方是否已经执行过 swap（执行过就不能再 swap）
-
+        self.has_swapped = False
 
     # ============================================================
     # 1) 规则层兜底：暴力检查“一步必杀/一步必防”
@@ -248,19 +247,18 @@ class SmartHexAgent(AgentBase):
         - 这是“战术必然”，不需要搜索
         - 让 AI 不会出现“明明能赢却去下别的”的离谱情况
         """
-        # 1) 我方一步必赢
+        # 1) 我方必杀
         win_move = self._find_winning_move_by_simulation(board, self.colour)
         if win_move is not None:
             return win_move
 
-        # 2) 对手一步必赢 -> 我方必须防
+        # 2) 对方必胜 => 我方必防
         opp = self.opp_colour()
         block_move = self._find_winning_move_by_simulation(board, opp)
         if block_move is not None:
             return block_move
 
         return None
-
 
     # ============================================================
     # 2) 一些“局面判断小工具”
@@ -293,7 +291,6 @@ class SmartHexAgent(AgentBase):
                 if board.tiles[x][y].colour == self.colour:
                     return False
         return True
-
 
     # ============================================================
     # 3) 开局：_choose_balanced_opening（详细解释版）
@@ -339,7 +336,7 @@ class SmartHexAgent(AgentBase):
             oc = Colour.BLUE if me == Colour.RED else Colour.RED
             my_cost = self.connectivity_evaluator.shortest_path_cost(b, me)
             opp_cost = self.connectivity_evaluator.shortest_path_cost(b, oc)
-            return opp_cost - my_cost
+            return opp_cost - my_cost  # 越大越好
 
         def pick_best_reply_light(b: Board, player: Colour, k_limit: int = 60) -> Optional[Move]:
             """
@@ -357,6 +354,7 @@ class SmartHexAgent(AgentBase):
             - 太大：每个候选都要 deep copy + 两次 shortest_path_cost，太慢
             60 是一个“够用但不爆炸”的经验值（你也可以调参）。
             """
+            # 用你已有的局部候选生成器，避免全盘扫
             cand = set(self._generate_local_candidates(b, player, k_limit=k_limit))
             cand.update(self._generate_local_candidates(b, Colour.BLUE if player == Colour.RED else Colour.RED,
                                                         k_limit=k_limit))
@@ -374,16 +372,12 @@ class SmartHexAgent(AgentBase):
                 new_my = self.connectivity_evaluator.shortest_path_cost(b2, player)
                 new_opp = self.connectivity_evaluator.shortest_path_cost(b2,
                                                                          Colour.BLUE if player == Colour.RED else Colour.RED)
-                # sc 越大说明这步越能“让对手更难 + 让自己更易”
-                # 0.6 是一个权重：更强调“别把自己走坏”
                 sc = (new_opp - base_opp) - 0.6 * (new_my - base_my)
-
                 if sc > best_sc:
                     best_sc, best_mv = sc, Move(x, y)
-
             return best_mv
 
-        # --- 构造候选开局点（中心附近，不要正中心） ---
+        # 候选：中心附近一圈/两圈，但不允许正中心（避免过强）
         cand = []
         for dx in range(-2, 3):
             for dy in range(-2, 3):
@@ -398,54 +392,39 @@ class SmartHexAgent(AgentBase):
 
         scored = []
         for x, y in cand:
-            # ---------- 情况A：对手不swap ----------
-            # 我方先下 (x,y)
+            # A) 对手不swap：我先下 -> 对手最佳回应 -> 评估我方adv
             bA = copy.deepcopy(board)
             bA.set_tile_colour(x, y, my_c)
-
-            # 对手选择一个“轻量最优回应”
             opp_reply = pick_best_reply_light(bA, opp_c)
             if opp_reply is not None:
                 bA.set_tile_colour(opp_reply.x, opp_reply.y, opp_c)
-
-            # 评估我方在“不swap且对手回应后”的优势
             advA = advantage(bA, my_c)
 
-            # ---------- 情况B：对手swap ----------
-            # 注意 swap 的关键点（写清楚避免以后改错）：
-            #
-            # - swap 发生后：我方颜色变成 opp_c
-            # - 但是棋盘上 (x,y) 这颗棋仍然是 my_c
-            #   因为它“归对手”了（对手拿走我第一手的棋子）
-            #
-            # 所以这里棋盘不用翻色，只需要用“新身份颜色”去评估优势。
+            # B) 对手swap：我先下 -> 对手swap(不落子，且这颗子归对手)
+            # swap 后：我方颜色变为 opp_c；棋盘上 (x,y) 这颗子仍是 my_c（归对手）
             bB = copy.deepcopy(board)
             bB.set_tile_colour(x, y, my_c)
-            advB = advantage(bB, opp_c)  # 我方视角换成 opp_c
+            advB = advantage(bB, opp_c)
 
-            # worst-case：对手会选让我最难受的那条分支
             worst = min(advA, advB)
 
-            # tie-break：轻微偏向中心（但不要压过抗swap的主目标）
+            # 轻微偏好中心（只是 tie-break）
             worst -= 0.03 * (abs(x - c) + abs(y - c))
 
             scored.append((worst, x, y))
 
-        # --- 软随机：top-K 里加权抽样 ---
+        # 软随机：从前K个里按分数加权抽样（避免每局同一点）
         scored.sort(key=lambda t: t[0], reverse=True)
         K = min(5, len(scored))
         top = scored[:K]
 
-        # temp 解释：
-        # - temp 越小：越接近“永远选第一名”（更强但更固定）
-        # - temp 越大：越随机（更难被针对但可能略弱）
+        # 权重：score 越高权越大；加个温度避免过度死板
         temp = 0.35
         weights = [pow(2.71828, (s - top[0][0]) / temp) for s, _, _ in top]
 
         pick = random.choices(top, weights=weights, k=1)[0]
         _, bx, by = pick
         return Move(bx, by)
-
 
     # ============================================================
     # 4) 局部候选点生成（解释为什么能减少“固定下同一点”的问题）
@@ -472,7 +451,7 @@ class SmartHexAgent(AgentBase):
         c = size // 2
         cand = set()
 
-        # (1) focus_colour 棋子邻域空位
+        # 1) 邻接 focus_colour 棋子
         for x in range(size):
             for y in range(size):
                 if board.tiles[x][y].colour == focus_colour:
@@ -481,18 +460,17 @@ class SmartHexAgent(AgentBase):
                             if board.tiles[nx][ny].colour is None:
                                 cand.add((nx, ny))
 
-        # (2) 中心附近空位
+        # 2) 中心附近（保证不至于“只在自己的小天地里玩”）
         for dx in range(-2, 3):
             for dy in range(-2, 3):
                 x, y = c + dx, c + dy
                 if 0 <= x < size and 0 <= y < size and board.tiles[x][y].colour is None:
                     cand.add((x, y))
 
-        # (3) 只取最靠近中心的前 k_limit 个（让候选稳定、可控）
+        # 3) 取前 k_limit 个（按到中心的距离排序）
         cand_list = list(cand)
         cand_list.sort(key=lambda xy: abs(xy[0] - c) + abs(xy[1] - c))
         return cand_list[:k_limit]
-
 
     # ============================================================
     # 5) 防守补丁（解释阈值意义）
@@ -524,6 +502,7 @@ class SmartHexAgent(AgentBase):
             base_my = self.connectivity_evaluator.shortest_path_cost(board, my_c)
             base_opp = self.connectivity_evaluator.shortest_path_cost(board, opp_c)
 
+            # 对手离胜利很近，或对手明显更顺：进入防守模式
             if not (base_opp <= 3.2 or base_opp + 0.6 < base_my):
                 return None
 
@@ -537,26 +516,24 @@ class SmartHexAgent(AgentBase):
             for x, y in candidates:
                 b2 = copy.deepcopy(board)
                 b2.set_tile_colour(x, y, my_c)
-
                 new_opp = self.connectivity_evaluator.shortest_path_cost(b2, opp_c)
                 new_my = self.connectivity_evaluator.shortest_path_cost(b2, my_c)
 
-                # gain 大：说明这步显著“抬高对手代价”
-                # -0.35*(new_my-base_my)：防止把自己堵死
+                # 主要抬高对手，其次别把自己也堵死
                 gain = (new_opp - base_opp) - 0.35 * (new_my - base_my)
 
                 if gain > best_gain:
                     best_gain = gain
                     best = Move(x, y)
 
+            # 只有当收益明显时才强行覆盖（避免过度“只防不攻”）
             if best and best_gain >= 0.55 and self._is_valid_move(best, board):
                 return best
-            return None
 
+            return None
         except Exception as e:
             logger.error(f"Error in defensive block: {e}")
             return None
-
 
     # ============================================================
     # 6) 轻量评分 + MCTS 后处理（解释阈值）
@@ -577,7 +554,7 @@ class SmartHexAgent(AgentBase):
         - 过小：会太激进，只顾恶心对手
         """
         if move.x == -1 and move.y == -1:
-            return -1e9
+            return -1e9  # 这里不考虑 swap
 
         my_c = self.colour
         opp_c = self.opp_colour()
@@ -591,6 +568,7 @@ class SmartHexAgent(AgentBase):
         new_my = self.connectivity_evaluator.shortest_path_cost(b2, my_c)
         new_opp = self.connectivity_evaluator.shortest_path_cost(b2, opp_c)
 
+        # 综合：抬高对手 + 降低自己 + 稍微偏好中心
         size = board.size
         c = size // 2
         center_penalty = 0.02 * (abs(move.x - c) + abs(move.y - c))
@@ -615,6 +593,7 @@ class SmartHexAgent(AgentBase):
 
             mcts_score = self._score_move_light(board, move)
 
+            # 在“自己棋子附近”以及“对手棋子附近”各取一批候选，避免闭门造车
             cand = set(self._generate_local_candidates(board, self.colour, k_limit=35))
             cand.update(self._generate_local_candidates(board, self.opp_colour(), k_limit=35))
 
@@ -630,16 +609,15 @@ class SmartHexAgent(AgentBase):
                     best_score = sc
                     best_move = mv
 
+            # 只有当替换“明显更好”才覆盖，避免破坏 MCTS 的整体计划
             if best_move != move and best_score > mcts_score + 0.65:
                 logger.info(f"Postprocess override: {move} -> {best_move} (score {mcts_score:.3f} -> {best_score:.3f})")
                 return best_move
 
             return move
-
         except Exception as e:
             logger.error(f"Error in MCTS postprocess: {e}")
             return move
-
 
     # ============================================================
     # 7) make_move：主决策入口（每一步为什么放这里）
@@ -658,12 +636,12 @@ class SmartHexAgent(AgentBase):
         self.turn_count = turn
 
         try:
-            # (0) 时间安全：快没时间就别想太多，先保证下出合法棋 + 不被一招秒
+            # 0. 时间安全检查
             remaining_time = self.time_manager.get_remaining_time()
             if remaining_time < 0.05:
                 return self._get_quick_move(board)
 
-            # (1) 第一手开局：使用“抗swap+抗回应”的开局点（并且带软随机）
+            # 0.5 空盘第一手：使用“中庸开局选择器”（不是强制中心）
             if turn == 1:
                 empty = True
                 for x in range(board.size):
@@ -676,63 +654,66 @@ class SmartHexAgent(AgentBase):
 
                 return self._choose_balanced_opening(board)
 
-            # (2) 如果对手刚刚 swap：引擎会改 self.colour，但我们要同步所有模块
+            # 1. 处理对手的交换            # 但我们需要更新has_swapped状态
             if opp_move and opp_move.is_swap():
                 self.has_swapped = True
-
-                # 同步颜色（否则模块还以为自己是旧颜色，会直接算错）
+                # 游戏引擎已经改变了我们的颜色，但我们需要更新所有模块
                 self.mcts_engine.colour = self.colour
                 self.threat_detector.colour = self.colour
                 self.pattern_recognizer.colour = self.colour
-
-                # swap 后局面“身份”变了，旧树没意义，直接清掉
+                # 重置MCTS根节点和状态（因为颜色改变了，棋盘状态也改变了）
                 self.mcts_engine.root_node = None
                 self.mcts_engine.last_move = None
                 self.mcts_engine.last_board_hash = None
 
-            # (3) turn==2：我是否要 swap（只在我还没 swap 且对手没 swap 时）
+            # 2. 交换决策（第二回合，且对手没有交换）
             if turn == 2 and not self.has_swapped and (not opp_move or not opp_move.is_swap()):
                 swap_move = self._decide_swap(board, opp_move)
                 if swap_move.x == -1 and swap_move.y == -1:
+                    # 交换后，更新颜色（游戏引擎会处理，但我们也要更新模块）
                     self.has_swapped = True
+                    # 注意：游戏引擎会在_make_move中改变颜色，这里我们只是标记
                 return swap_move
 
-            # (4) ThreatDetector：优先级高于 MCTS（战术点不能错）
+            # 3. 威胁检测（最高优先级）
             immediate_threats = self.threat_detector.detect_immediate_threats(
                 board, self.opp_colour()
             )
+
+            # 3.1 如果有必下的点，直接返回
             for x, y, threat_type in immediate_threats:
                 if threat_type == "WIN":
-                    return Move(x, y)
+                    return Move(x, y)  # 立即获胜（最高优先级）
                 elif threat_type == "LOSE":
-                    return Move(x, y)
+                    return Move(x, y)  # 必须阻止
 
-            # (5) 规则兜底：一步必赢/一步必防
+            # 3.2 规则层“必杀必防”兜底检查（独立于 ThreatDetector）
             priority_move = self._check_priority_moves(board)
             if priority_move is not None:
                 return priority_move
+
+            # 3.3 如果这是我在本局的第一颗棋子，无论先后手，都优先靠近中心落子
             if self._is_my_first_move(board):
                 move = self._get_first_valid_move(board)
                 if self._is_valid_move(move, board):
                     self.last_move = move
                     return move
-
-            # (6) 防守补丁：对手太顺先挡一手
+            # 3.4 防守补丁：对手很顺时先强制挡一手（避免只顾自己下）
             defensive = self._choose_defensive_block(board)
             if defensive is not None:
                 return defensive
 
-            # (7) 时间分配
-                total_turns_remaining = self._estimate_remaining_turns(board)
-                time_budget = self.time_manager.allocate_time(
-                    board,
-                    remaining_time,
-                    total_turns_remaining,
-                    self.threat_detector,
-                    self.opp_colour()
-                )
+            # 4. 时间分配
+            total_turns_remaining = self._estimate_remaining_turns(board)
+            time_budget = self.time_manager.allocate_time(
+                board,
+                remaining_time,
+                total_turns_remaining,
+                self.threat_detector,
+                self.opp_colour()
+            )
 
-            # (8) MCTS 搜索
+            # 5. MCTS搜索
             try:
                 # 更新MCTS引擎的last_move（用于根节点复用）
                 if opp_move and not opp_move.is_swap():
@@ -832,7 +813,6 @@ class SmartHexAgent(AgentBase):
         _, _, bx, by = random.choice(scored[:K])
         return Move(bx, by)
 
-
     # ============================================================
     # 8) swap 判定（重点：把“翻色/归属”写得非常清楚）
     # ============================================================
@@ -883,7 +863,7 @@ class SmartHexAgent(AgentBase):
             oc = opp_of(my_colour)
             my_cost = self.connectivity_evaluator.shortest_path_cost(b, my_colour)
             opp_cost = self.connectivity_evaluator.shortest_path_cost(b, oc)
-            return opp_cost - my_cost
+            return opp_cost - my_cost  # 越大越好
 
         def pick_best_move_light(b: Board, player_colour: Colour, k_limit: int = 60) -> Optional[Move]:
             """
@@ -891,6 +871,7 @@ class SmartHexAgent(AgentBase):
             - 候选集来自局部生成器（双方棋子周围 + 中心附近）
             - 评分：抬高对手代价 + 降低自己代价（权重 0.6）
             """
+            # 用你已有的局部候选生成器：靠近双方棋子 + 中心附近
             cand = set(self._generate_local_candidates(b, player_colour, k_limit=k_limit))
             cand.update(self._generate_local_candidates(b, opp_of(player_colour), k_limit=k_limit))
 
@@ -909,6 +890,7 @@ class SmartHexAgent(AgentBase):
                 new_my = self.connectivity_evaluator.shortest_path_cost(b2, player_colour)
                 new_opp = self.connectivity_evaluator.shortest_path_cost(b2, opp_of(player_colour))
 
+                # 轻量评分：主要抬高对手代价 + 降低自己代价
                 score = (new_opp - base_opp) - 0.6 * (new_my - base_my)
 
                 if score > best_score:
@@ -921,28 +903,32 @@ class SmartHexAgent(AgentBase):
             my_c = self.colour
             opp_c = self.opp_colour()
 
-            # -------- A) 不 swap：我先走一步 --------
+            # -------------------------
+            # A) 不 swap：我先走一步再评估
+            # -------------------------
             bA = copy.deepcopy(board)
             mvA = pick_best_move_light(bA, my_c)
             if mvA is not None:
                 bA.set_tile_colour(mvA.x, mvA.y, my_c)
             advA = advantage(bA, my_c)
 
-            # -------- B) swap：第一手棋子归我（新颜色 opp_c），然后对手走一步 --------
+            # -------------------------
+            # B) swap：第一手棋子归我（颜色翻为 swap 后我的颜色），然后对手走一步再评估
+            # swap 后我的颜色 = opp_c，对手颜色 = my_c
+            # -------------------------
             bB = copy.deepcopy(board)
+            bB.set_tile_colour(opp_move.x, opp_move.y, opp_c)  # 关键：第一手棋子归我(新颜色)
 
-            # 关键行：swap 后那颗棋子要变成我的新颜色（opp_c）
-            bB.set_tile_colour(opp_move.x, opp_move.y, opp_c)
-
-            # swap 后轮到对手走，对手颜色是原 my_c
-            mvB_opp = pick_best_move_light(bB, my_c)
+            mvB_opp = pick_best_move_light(bB, my_c)  # swap 后轮到对手（颜色=原 my_c）走
             if mvB_opp is not None:
                 bB.set_tile_colour(mvB_opp.x, mvB_opp.y, my_c)
 
-            # swap 后我方颜色 = opp_c
-            advB = advantage(bB, opp_c)
+            advB = advantage(bB, opp_c)  # 我现在是 opp_c
 
-            # margin：swap 门槛（越大越不爱 swap）
+            # -------------------------
+            # 判定：swap 只有在“明显更好”时才做
+            # 这里的 margin 不需要很大，因为比较基准已经公平了
+            # -------------------------
             margin = 0.35
             if advB > advA + margin:
                 self.has_swapped = True
@@ -954,7 +940,6 @@ class SmartHexAgent(AgentBase):
         except Exception as e:
             logger.error(f"Error in swap decision: {e}")
             return self._get_first_valid_move(board)
-
 
     # ============================================================
     # 9) 兜底走法（详细解释每个 fallback 的意义）
@@ -1007,7 +992,6 @@ class SmartHexAgent(AgentBase):
             # 最后的备用方案
             return self._get_first_valid_move(board)
 
-
     def _get_quick_move(self, board: Board) -> Move:
         """
         时间不足时的快速走法：
@@ -1058,10 +1042,10 @@ class SmartHexAgent(AgentBase):
 
     def _is_valid_move(self, move: Move, board: Board) -> bool:
         """
-        走法合法性：
-        - (-1,-1) 代表 swap：永远合法
-        - 普通点：必须在棋盘内且为空
-        """
+         走法合法性：
+         - (-1,-1) 代表 swap：永远合法
+         - 普通点：必须在棋盘内且为空
+         """
         if move.x == -1 and move.y == -1:
             return True  # 交换走法
 
@@ -1080,4 +1064,4 @@ class SmartHexAgent(AgentBase):
             for y in range(board.size)
             if board.tiles[x][y].colour is None
         )
-        return max(1, empty_tiles // 2)
+        return max(1, empty_tiles // 2)  # 粗略估算
