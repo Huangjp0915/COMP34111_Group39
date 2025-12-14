@@ -29,32 +29,30 @@ class SmartHexAgent(AgentBase):
     """
     智能 Hex 代理 (MoHex 架构版)。
     """
+
     def __init__(self, colour: Colour):
         super().__init__(colour)
-        
+
         # 1. 初始化核心模块
         # Evaluator: 提供 Dijkstra + VC 距离评估
         self.connectivity_evaluator = ConnectivityEvaluator()
-        
+
         # Pattern: 提供 MoHex 风格的 Gamma 战术权重
         self.pattern_recognizer = PatternRecognizer(colour)
-        
+
         # Threat: 提供必胜/必败的几何检测
         self.threat_detector = ThreatDetector(colour)
-        
+
         # MCTS: 搜索引擎 (Gamma -> Prior)
         self.mcts_engine = MCTSEngine(colour)
-        
+
         # [关键] 依赖注入
-        # 确保 MCTS 引擎使用与 Agent 相同的评估器和识别器实例
-        # 这样共享缓存 (如 Gamma Cache, Distance Map) 能最大化性能
         self.mcts_engine.connectivity_evaluator = self.connectivity_evaluator
         self.mcts_engine.pattern_recognizer = self.pattern_recognizer
-        
-        # 时间管理
-        self.time_manager = TimeManager()
-        self.time_manager.start_timer()
-        
+
+        # [修改] 时间管理 - 传入颜色，用于静态变量区分红/蓝时钟
+        self.time_manager = TimeManager(self.colour)
+
         # 状态跟踪
         self.last_move = None
         self.turn_count = 0
@@ -64,8 +62,9 @@ class SmartHexAgent(AgentBase):
         """
         主决策入口
         """
+        self.time_manager.start_turn_timer()
         self.turn_count = turn
-        
+
         try:
             # --- 0. 基础状态维护 ---
             # 检查剩余时间
@@ -87,7 +86,7 @@ class SmartHexAgent(AgentBase):
             # Turn 2: Swap 决策 (基于 Dijkstra Advantage)
             if turn == 2 and not self.has_swapped and (not opp_move or not opp_move.is_swap()):
                 swap = self._decide_swap(board, opp_move)
-                if swap.x == -1: 
+                if swap.x == -1:
                     self.has_swapped = True
                     # 注意: 游戏引擎会在收到 swap 后自动处理颜色变更
                     return swap
@@ -95,7 +94,7 @@ class SmartHexAgent(AgentBase):
             # --- 2. 战术必应阶段 (Highest Priority) ---
             # 威胁检测：直接赢 > 必须防
             threats = self.threat_detector.detect_immediate_threats(board, self.opp_colour())
-            
+
             for x, y, type_ in threats:
                 if type_ == "WIN": return Move(x, y)
             for x, y, type_ in threats:
@@ -117,23 +116,23 @@ class SmartHexAgent(AgentBase):
             # 估算剩余回合
             rem_turns = self._estimate_remaining_turns(board)
             # 分配时间预算
-            budget = self.time_manager.allocate_time(board, remaining_time, rem_turns, 
+            budget = self.time_manager.allocate_time(board, remaining_time, rem_turns,
                                                     self.threat_detector, self.opp_colour())
-            
+
             # 更新 MCTS 状态 (传入对手上一手，用于激活 Local Patterns)
             if opp_move and not opp_move.is_swap():
                 self.mcts_engine.last_move = opp_move
             else:
                 self.mcts_engine.last_move = None
                 self.mcts_engine.reset_tree()
-            
+
             # 执行搜索
             best_move = self.mcts_engine.search(board, budget)
 
             # --- 5. 后处理与验证阶段 ---
             # 利用 PatternRecognizer 的 Inferior Check 进行二次过滤
             final_move = self._postprocess_mcts_move(board, best_move)
-            
+
             # 最终合法性检查 (防止任何可能的异常)
             if not self._is_valid_move(final_move, board):
                 logger.error(f"Invalid move {final_move} generated, falling back.")
@@ -147,6 +146,10 @@ class SmartHexAgent(AgentBase):
             import traceback
             traceback.print_exc()
             return self._get_fallback_move(board)
+
+        # 无论如何（正常返回或异常），在函数退出前停止计时
+        finally:
+            self.time_manager.stop_turn_timer()
 
     # ==========================================
     # 策略子模块
