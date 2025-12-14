@@ -1,6 +1,6 @@
 """
 Group39 Hex AI Agent - 主代理类
-EH-v4.7
+EH-v4.8
 """
 
 # ========================
@@ -297,134 +297,46 @@ class SmartHexAgent(AgentBase):
     # ============================================================
     def _choose_balanced_opening(self, board: Board) -> Move:
         """
-        【目的】
-        解决两个典型开局问题：
-        1) “每盘都下同一个点” -> 会被背谱针对，看起来像降智
-        2) “第一手太强/太中心” -> 对手 swap 后我会吃亏
+        【开局落子库（Opening Book）】
+        目标：不要每局都固定同一点，也不要用过强/过中心的第一手诱发 swap 风险。
+        做法：准备一小组“相对平均”的开局点位（来自开局章节的典型建议思路），
+             每局从库里随机选一个（默认加权，略偏向 a6/a7/a8），然后直接下。
 
-        【核心思想：2-ply worst-case + 软随机】
-        我考虑每个候选开局点 (x,y)：
-        - 情况A：对手不 swap，会下一个“轻量最优回应”（我们用局部候选+cost增量近似）
-        - 情况B：对手 swap（不落子，但第一手棋子归对手；我方颜色互换）
-        然后我取 worst = min(advA, advB)，让这个 worst 最大。
-        => 这就是“抗针对/抗 swap”的开局。
-
-        【软随机是什么】
-        - 我不是永远选分数最高的那个点
-        - 而是从 top-K 里面按权重抽一个
-        - 权重越高越偏向最好点，但仍然有小概率选到次优点
-        => 这样对手很难靠固定套路针对你
-
-        【候选范围】
-        - 只看中心附近（dx,dy 在 [-2,2]）
-        - 但排除 dist==0（正中心），因为中心往往过强，swap 风险更大
-        - dist 限制在 1..3 是为了：不要太偏边、也不要离中心太远没意义
+        坐标约定：Move(x, y) 对应 board.tiles[x][y]（0-index）
+        - 例如 (0,5) 表示第0列第5行（a6），具体含义以你们工程坐标为准。
         """
+
         size = board.size
-        c = size // 2
-        my_c = self.colour
-        opp_c = self.opp_colour()
 
-        def advantage(b: Board, me: Colour) -> float:
-            """
-            优势定义（统一口径）：
-            advantage = opp_cost - my_cost
-            - my_cost 越小越好
-            - opp_cost 越大越好
-            所以 advantage 越大越“我更舒服”
-            """
-            oc = Colour.BLUE if me == Colour.RED else Colour.RED
-            my_cost = self.connectivity_evaluator.shortest_path_cost(b, me)
-            opp_cost = self.connectivity_evaluator.shortest_path_cost(b, oc)
-            return opp_cost - my_cost  # 越大越好
+        # ------------------------------------------------------------
+        # 1) 构建一个开局库（参考马修的文章）
+        # ------------------------------------------------------------
+        opening_book = [
+            (5, 0),  # a6 (0,5) [红坐标在前，蓝坐标在后，代码中相反]
+            (6, 0),  # a7 (0,6)
+            (7, 0),  # a8 (0,7)
+            (1, 2),  # c2 (2,1)
+            (9, 2),  # c10 (2,9)
+            ]
 
-        def pick_best_reply_light(b: Board, player: Colour, k_limit: int = 60) -> Optional[Move]:
-            """
-            【目的】
-            模拟“对手在不 swap 情况下，会怎么回应我第一手”。
+        # 加权随机：更偏向 a6/a7/a8（更“平均开局”风格）
+        opening_weights = [4, 5, 4, 1, 1]
 
-            【方法：轻量近似，不跑 MCTS】
-            1) 生成局部候选点（靠近棋子 + 中心附近）
-            2) 对每个候选点，假设 player 下在那里
-            3) 看它对 (opp_cost - my_cost) 的增量贡献
-            4) 选贡献最大的点
+        # ------------------------------------------------------------
+        # 2) 过滤：只保留“合法且为空”的点
+        # ------------------------------------------------------------
+        legal_points = []
+        legal_weights = []
+        for (x, y), w in zip(opening_book, opening_weights):
+            if 0 <= x < size and 0 <= y < size and board.tiles[x][y].colour is None:
+                legal_points.append((x, y))
+                legal_weights.append(w)
 
-            【为什么 k_limit 默认 60】
-            - 太小：对手回应可能选得很蠢（评估失真）
-            - 太大：每个候选都要 deep copy + 两次 shortest_path_cost，太慢
-            60 是一个“够用但不爆炸”的经验值（你也可以调参）。
-            """
-            # 用你已有的局部候选生成器，避免全盘扫
-            cand = set(self._generate_local_candidates(b, player, k_limit=k_limit))
-            cand.update(self._generate_local_candidates(b, Colour.BLUE if player == Colour.RED else Colour.RED,
-                                                        k_limit=k_limit))
-
-            base_my = self.connectivity_evaluator.shortest_path_cost(b, player)
-            base_opp = self.connectivity_evaluator.shortest_path_cost(b,
-                                                                      Colour.BLUE if player == Colour.RED else Colour.RED)
-
-            best_mv, best_sc = None, -1e18
-            for x, y in cand:
-                if b.tiles[x][y].colour is not None:
-                    continue
-                b2 = copy.deepcopy(b)
-                b2.set_tile_colour(x, y, player)
-                new_my = self.connectivity_evaluator.shortest_path_cost(b2, player)
-                new_opp = self.connectivity_evaluator.shortest_path_cost(b2,
-                                                                         Colour.BLUE if player == Colour.RED else Colour.RED)
-                sc = (new_opp - base_opp) - 0.6 * (new_my - base_my)
-                if sc > best_sc:
-                    best_sc, best_mv = sc, Move(x, y)
-            return best_mv
-
-        # 候选：中心附近一圈/两圈，但不允许正中心（避免过强）
-        cand = []
-        for dx in range(-2, 3):
-            for dy in range(-2, 3):
-                x, y = c + dx, c + dy
-                if 0 <= x < size and 0 <= y < size and board.tiles[x][y].colour is None:
-                    dist = abs(dx) + abs(dy)
-                    if 1 <= dist <= 3:
-                        cand.append((x, y))
-
-        if not cand:
-            return self._get_first_valid_move(board)
-
-        scored = []
-        for x, y in cand:
-            # A) 对手不swap：我先下 -> 对手最佳回应 -> 评估我方adv
-            bA = copy.deepcopy(board)
-            bA.set_tile_colour(x, y, my_c)
-            opp_reply = pick_best_reply_light(bA, opp_c)
-            if opp_reply is not None:
-                bA.set_tile_colour(opp_reply.x, opp_reply.y, opp_c)
-            advA = advantage(bA, my_c)
-
-            # B) 对手swap：我先下 -> 对手swap(不落子，且这颗子归对手)
-            # swap 后：我方颜色变为 opp_c；棋盘上 (x,y) 这颗子仍是 my_c（归对手）
-            bB = copy.deepcopy(board)
-            bB.set_tile_colour(x, y, my_c)
-            advB = advantage(bB, opp_c)
-
-            worst = min(advA, advB)
-
-            # 轻微偏好中心（只是 tie-break）
-            worst -= 0.03 * (abs(x - c) + abs(y - c))
-
-            scored.append((worst, x, y))
-
-        # 软随机：从前K个里按分数加权抽样（避免每局同一点）
-        scored.sort(key=lambda t: t[0], reverse=True)
-        K = min(5, len(scored))
-        top = scored[:K]
-
-        # 权重：score 越高权越大；加个温度避免过度死板
-        temp = 0.35
-        weights = [pow(2.71828, (s - top[0][0]) / temp) for s, _, _ in top]
-
-        pick = random.choices(top, weights=weights, k=1)[0]
-        _, bx, by = pick
-        return Move(bx, by)
+        # ------------------------------------------------------------
+        # 3) 随机选点：默认加权随机（更偏向 a6/a7/a8）
+        # ------------------------------------------------------------
+        x, y = random.choices(legal_points, weights=legal_weights, k=1)[0]
+        return Move(x, y)
 
     # ============================================================
     # 4) 局部候选点生成（解释为什么能减少“固定下同一点”的问题）
@@ -770,48 +682,6 @@ class SmartHexAgent(AgentBase):
             import traceback
             traceback.print_exc()
             return self._get_fallback_move(board)
-
-    def _choose_balanced_opening_move(self, board: Board) -> Move:
-        """
-        空盘第一手：选择“中庸”的开局点（让局面对双方尽量平衡）
-        做法：只看中心附近一圈候选点，模拟落子后用 shortest_path_cost 计算平衡度。
-        """
-        size = board.size
-        c = size // 2
-
-        # 候选：中心附近半径 r 的点（别全盘扫，太慢也没必要）
-        r = 2
-        candidates = []
-        for x in range(max(0, c - r), min(size, c + r + 1)):
-            for y in range(max(0, c - r), min(size, c + r + 1)):
-                if board.tiles[x][y].colour is None:
-                    candidates.append((x, y))
-
-        if not candidates:
-            return self._get_first_valid_move(board)
-
-        scored = []
-        for x, y in candidates:
-            b2 = copy.deepcopy(board)
-            b2.set_tile_colour(x, y, self.colour)
-
-            red_cost = self.connectivity_evaluator.shortest_path_cost(b2, Colour.RED)
-            blue_cost = self.connectivity_evaluator.shortest_path_cost(b2, Colour.BLUE)
-
-            # “中庸”指标：红蓝代价差越小越好（越平衡）
-            balance = abs(red_cost - blue_cost)
-
-            # 轻微偏好：离中心近一点（只是 tie-break，不是强制中心）
-            dist = abs(x - c) + abs(y - c)
-
-            scored.append((balance, dist, x, y))
-
-        scored.sort(key=lambda t: (t[0], t[1]))
-
-        # 从最好的前 K 个里随机选一个，避免套路固定
-        K = min(3, len(scored))
-        _, _, bx, by = random.choice(scored[:K])
-        return Move(bx, by)
 
     # ============================================================
     # 8) swap 判定（重点：把“翻色/归属”写得非常清楚）
