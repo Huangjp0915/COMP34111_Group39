@@ -107,20 +107,39 @@ class PatternRecognizer:
         self._cache[cache_key] = gammas
         return gammas
 
-    def get_prior(self, board: Board, move: Move, colour: Colour) -> float:
+    def get_prior(self, board: Board, move: Move, colour: Colour, opp_last_move: Optional[Move] = None) -> float:
         """
         [兼容接口] 获取单点的归一化评分 (0.0 - 1.0)。
         用于 Agent 的 _score_move_light 后处理。
-        注意：此处没有 opp_last_move 上下文，只能计算 Global + Inferior。
+        
+        [修复] 增加了 opp_last_move 参数，允许计算 Local Pattern。
         """
         # 检查劣势点
         if self._is_inferior(board, move.x, move.y, colour):
             return 0.0
             
-        # 计算 Global Gamma
-        gamma = self._eval_global_pattern(board, move.x, move.y, colour)
+        # 计算完整 Gamma
+        # 这里复用 get_all_gammas 的逻辑比较重，为了效率我们单独调用内部函数
         
-        # 简单归一化映射 (1.0 -> 0.1, 15.0 -> 0.8)
+        # 1. Local
+        local_g = 0.0
+        if opp_last_move:
+            local_g = self._eval_local_pattern(board, move.x, move.y, colour, opp_last_move)
+            
+        # 2. Global
+        global_g = self._eval_global_pattern(board, move.x, move.y, colour)
+        
+        gamma = max(self.GAMMA_DEFAULT, global_g)
+        if local_g > 0:
+            if local_g >= self.GAMMA_LOCAL_SHOULDER:
+                gamma = local_g
+            else:
+                gamma += local_g
+        
+        # 归一化映射 (MoHex Gamma -> 0~1 Score)
+        if gamma >= self.GAMMA_LOCAL_URGENT: return 1.0
+        if gamma >= self.GAMMA_LOCAL_CAP: return 0.95
+        if gamma >= self.GAMMA_LOCAL_SHOULDER: return 0.9
         if gamma >= self.GAMMA_GLOBAL_BRIDGE: return 0.8
         if gamma >= self.GAMMA_GLOBAL_EDGE: return 0.6
         return 0.1
