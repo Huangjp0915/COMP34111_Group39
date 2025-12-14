@@ -19,11 +19,22 @@ class TimeManager:
     - 时间分配
     - 时间跟踪
     """
-    
-    def __init__(self):
-        self.start_time: Optional[float] = None
-        self.total_time_limit = 600
-        self.used_time = 0.0
+
+    _GLOBAL_CLOCKS = {}
+
+    def __init__(self, colour: Colour):
+        # 使用颜色作为唯一ID
+        # 这行代码实际上就是“身份绑定”，一旦绑定，
+        # 只要 TimeManager 对象不被销毁，它就永远指向这个颜色。
+        self.colour_key = str(colour)
+        self.total_time_limit = 300.0
+
+        # 如果这个颜色的时钟还没初始化，就建立一个档案
+        if self.colour_key not in TimeManager._GLOBAL_CLOCKS:
+            TimeManager._GLOBAL_CLOCKS[self.colour_key] = {
+                "accumulated_time": 0.0,  # 银行里存了多少已用时间
+                "turn_start_time": None  # 当前这一手开始思考的时间点
+            }
 
     def _count_connections(self, board: Board, colour: Colour) -> int:
         """统计某一方的“直接连接边数”，用于衡量局面结构复杂度"""
@@ -89,24 +100,35 @@ class TimeManager:
         # 归一化到[0,1]，1.0->0，1.5->1
         normalized = (score - 1.0) / 0.5
         return max(0.0, min(1.0, normalized))
-    
-    def start_timer(self):
-        """开始计时"""
-        self.start_time = time.time()
-        self.used_time = 0.0
-    
+
+    def start_turn_timer(self):
+        """开始本回合计时"""
+        # 记录当前时间戳到全局字典
+        TimeManager._GLOBAL_CLOCKS[self.colour_key]["turn_start_time"] = time.time()
+
+    def stop_turn_timer(self):
+        """停止本回合计时并累加"""
+        clock = TimeManager._GLOBAL_CLOCKS[self.colour_key]
+
+        # 如果计时器是开着的，计算差值并累加
+        if clock["turn_start_time"] is not None:
+            elapsed = time.time() - clock["turn_start_time"]
+            clock["accumulated_time"] += elapsed
+            clock["turn_start_time"] = None  # 关掉计时器
+
     def get_remaining_time(self) -> float:
-        """
-        获取剩余时间
-        
-        Returns:
-            float: 剩余时间（秒）
-        """
-        if self.start_time is None:
-            return self.total_time_limit
-        
-        elapsed = time.time() - self.start_time
-        remaining = self.total_time_limit - elapsed
+        """从全局静态内存中读取剩余时间"""
+        clock = TimeManager._GLOBAL_CLOCKS[self.colour_key]
+
+        # 读取以前用掉的总时间
+        total_used = clock["accumulated_time"]
+
+        # 如果当前正在思考（计时器开着），把这几秒也算进去
+        if clock["turn_start_time"] is not None:
+            current_turn_duration = time.time() - clock["turn_start_time"]
+            total_used += current_turn_duration
+
+        remaining = self.total_time_limit - total_used
         return max(0.0, remaining)
     
     def assess_position_complexity(self, board: Board, threat_detector=None, opp_colour=None) -> float:
@@ -371,4 +393,3 @@ class TimeManager:
         """
         kills = []
         return kills
-

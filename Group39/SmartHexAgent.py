@@ -1,11 +1,11 @@
 """
 Group39 Hex AI Agent - 主代理类
-EH-v7.0 - MoHex Architecture Integrated (Full Version)
+EH-v7.4 - Logic Fixes & Debug
 
-集成特性：
-1. MoHex Style Patterns: 利用 Gamma 权重识别 Local/Global 模式。
-2. Dijkstra Evaluator: 基于势能场的全局距离评估。
-3. Consistent Scoring: MCTS 与后处理使用统一的战术评价标准。
+修复日志：
+1. [CRITICAL] 移除了 __init__ 中的 start_timer，防止计入对手时间。
+2. 在 make_move 中正确管理 start_timer / stop_timer 的生命周期。
+3. 集成了文件日志调试功能。
 """
 
 import copy
@@ -33,29 +33,19 @@ class SmartHexAgent(AgentBase):
         super().__init__(colour)
         
         # 1. 初始化核心模块
-        # Evaluator: 提供 Dijkstra + VC 距离评估
         self.connectivity_evaluator = ConnectivityEvaluator()
-        
-        # Pattern: 提供 MoHex 风格的 Gamma 战术权重
         self.pattern_recognizer = PatternRecognizer(colour)
-        
-        # Threat: 提供必胜/必败的几何检测
         self.threat_detector = ThreatDetector(colour)
-        
-        # MCTS: 搜索引擎 (Gamma -> Prior)
         self.mcts_engine = MCTSEngine(colour)
         
-        # [关键] 依赖注入
-        # 确保 MCTS 引擎使用与 Agent 相同的评估器和识别器实例
-        # 这样共享缓存 (如 Gamma Cache, Distance Map) 能最大化性能
+        # 注入依赖
         self.mcts_engine.connectivity_evaluator = self.connectivity_evaluator
         self.mcts_engine.pattern_recognizer = self.pattern_recognizer
         
         # 时间管理
-        self.time_manager = TimeManager()
-        self.time_manager.start_timer()
+        self.time_manager = TimeManager(self.colour)
+        # [修复] 初始化时不再开启计时器！
         
-        # 状态跟踪
         self.last_move = None
         self.turn_count = 0
         self.has_swapped = False
@@ -66,80 +56,81 @@ class SmartHexAgent(AgentBase):
         """
         self.turn_count = turn
         
+        # [计时开始] 仅当轮到我方行动时，才开始计时
+        self.time_manager.start_turn_timer()
+        
+        # 强制同步颜色
+        self._ensure_colour_sync()
+
         try:
             # --- 0. 基础状态维护 ---
-            # 检查剩余时间
             remaining_time = self.time_manager.get_remaining_time()
-            if remaining_time < 0.05:
-                return self._get_quick_move(board)
-
+            
             # 处理对手的 Swap 动作
             if opp_move and opp_move.is_swap():
                 self.has_swapped = True
-                self._update_modules_colour(self.colour) # 重新同步颜色状态
-                self.mcts_engine.reset_tree() # 局势突变，旧树失效
+                self.mcts_engine.reset_tree() 
+
+            # 时间极少时的快速响应 (例如 < 0.5s)
+            if remaining_time < 0.5:
+                return self._get_quick_move(board)
 
             # --- 1. 开局阶段 ---
-            # Turn 1: 使用开局库
             if turn == 1:
                 return self._choose_balanced_opening(board)
 
-            # Turn 2: Swap 决策 (基于 Dijkstra Advantage)
             if turn == 2 and not self.has_swapped and (not opp_move or not opp_move.is_swap()):
                 swap = self._decide_swap(board, opp_move)
                 if swap.x == -1: 
                     self.has_swapped = True
-                    # 注意: 游戏引擎会在收到 swap 后自动处理颜色变更
                     return swap
 
-            # --- 2. 战术必应阶段 (Highest Priority) ---
-            # 威胁检测：直接赢 > 必须防
+            # --- 2. 战术必应阶段 ---
             threats = self.threat_detector.detect_immediate_threats(board, self.opp_colour())
-            
             for x, y, type_ in threats:
                 if type_ == "WIN": return Move(x, y)
             for x, y, type_ in threats:
                 if type_ == "LOSE": return Move(x, y)
 
-            # 规则兜底 (Double Check)
             priority_move = self._check_priority_moves(board)
             if priority_move: return priority_move
 
-            # --- 3. 战略防守阶段 (Strategic Defense) ---
-            # 利用 Dijkstra 的势能场判断对手是否形成了强力 VC
-            # 如果是，尝试寻找能最大程度增加对手 Cost 的"镇头"或"肩冲"点
+            # --- 3. 战略防守阶段 ---
             defensive = self._choose_defensive_block(board)
             if defensive:
                 logger.info(f"Strategic Block Triggered at {defensive}")
+                self.last_move = defensive
+                self._debug_visualize_weights(board, opp_move, defensive)
                 return defensive
 
-            # --- 4. MCTS 搜索阶段 (Main Search) ---
-            # 估算剩余回合
+            # --- 4. MCTS 搜索阶段 ---
             rem_turns = self._estimate_remaining_turns(board)
-            # 分配时间预算
             budget = self.time_manager.allocate_time(board, remaining_time, rem_turns, 
                                                     self.threat_detector, self.opp_colour())
             
-            # 更新 MCTS 状态 (传入对手上一手，用于激活 Local Patterns)
             if opp_move and not opp_move.is_swap():
                 self.mcts_engine.last_move = opp_move
             else:
                 self.mcts_engine.last_move = None
                 self.mcts_engine.reset_tree()
             
-            # 执行搜索
             best_move = self.mcts_engine.search(board, budget)
 
             # --- 5. 后处理与验证阶段 ---
-            # 利用 PatternRecognizer 的 Inferior Check 进行二次过滤
             final_move = self._postprocess_mcts_move(board, best_move)
             
-            # 最终合法性检查 (防止任何可能的异常)
             if not self._is_valid_move(final_move, board):
                 logger.error(f"Invalid move {final_move} generated, falling back.")
-                return self._get_fallback_move(board)
+                final_move = self._get_fallback_move(board)
 
             self.last_move = final_move
+            
+            # [DEBUG] 输出权重分布到文件
+            if final_move.x != -1:
+                self._debug_visualize_weights(board, opp_move, final_move)
+            else:
+                logger.debug(f"\n[TURN {turn} DEBUG] Agent chose to SWAP.")
+
             return final_move
 
         except Exception as e:
@@ -147,37 +138,48 @@ class SmartHexAgent(AgentBase):
             import traceback
             traceback.print_exc()
             return self._get_fallback_move(board)
+        
+        finally:
+            # [计时结束] 停止计时并累加本回合耗时
+            self.time_manager.stop_turn_timer()
+
+    # ==========================================
+    # 辅助与同步
+    # ==========================================
+
+    def _ensure_colour_sync(self):
+        """确保所有子模块的颜色与 Agent 当前颜色一致"""
+        if self.pattern_recognizer.colour != self.colour:
+            logger.info(f"Syncing colour from {self.pattern_recognizer.colour} to {self.colour}")
+            self.pattern_recognizer.colour = self.colour
+            self.threat_detector.colour = self.colour
+            self.mcts_engine.colour = self.colour
+            self.pattern_recognizer._cache.clear()
+            self.mcts_engine.reset_tree()
 
     # ==========================================
     # 策略子模块
     # ==========================================
 
     def _choose_balanced_opening(self, board: Board) -> Move:
-        """
-        开局策略：选择经典的平衡点 (a8, b7 等)。
-        使用加权随机以避免被对手背谱针对。
-        """
         size = board.size
-        # 候选列表 [(row, col), weight] (基于 11x11)
-        # 注意：这里使用逻辑坐标 (Row, Col)，后面会根据颜色转换
-        # Red 连接 Top-Bottom (Rows), Blue 连接 Left-Right (Cols)
         candidates = [
-            ((1, size//2), 5),      # 防守型
-            ((2, size//2 - 1), 4),  # 平衡型
-            ((1, size//2 + 1), 4),  # 平衡型
-            ((0, size - 3), 3),     # 诱导 Swap
-            ((size//2, 0), 2)       # 边路开局
+            ((1, size//2), 5),
+            ((2, size//2 - 1), 4),
+            ((1, size//2 + 1), 4),
+            ((0, size - 3), 3),
+            ((size//2, 0), 2)
         ]
         
         valid_points = []
         valid_weights = []
         
         for (r, c), w in candidates:
-            # 适配坐标系
+            # 适配坐标系: Red(Row), Blue(Col)
             if self.colour == Colour.RED:
-                x, y = r, c # x是行
+                x, y = r, c 
             else:
-                x, y = c, r # y是行
+                x, y = c, r 
             
             if 0 <= x < size and 0 <= y < size and board.tiles[x][y].colour is None:
                 valid_points.append(Move(x, y))
@@ -185,48 +187,32 @@ class SmartHexAgent(AgentBase):
         
         if valid_points:
             return random.choices(valid_points, weights=valid_weights, k=1)[0]
-        
-        # 兜底：中心空位
         return self._get_first_valid_move(board)
 
     def _decide_swap(self, board: Board, opp_move: Move) -> Move:
-        """
-        Swap 决策：利用 Dijkstra Evaluator 计算双方势能差 (Advantage)。
-        """
         if self.has_swapped: return self._get_fallback_move(board)
         
         my_c = self.colour
         opp_c = self.opp_colour()
         
-        # 1. 评估 STAY (我不换，我继续下)
         best_stay_adv = -999.0
-        # 快速扫描几个好点
         cands = self._generate_local_candidates(board, my_c, limit=15)
         for x, y in cands:
             b_sim = copy.deepcopy(board)
             b_sim.set_tile_colour(x, y, my_c)
-            
             mc = self.connectivity_evaluator.shortest_path_cost(b_sim, my_c)
             oc = self.connectivity_evaluator.shortest_path_cost(b_sim, opp_c)
-            # Adv = 敌方代价 - 我方代价 (我方代价越小越好)
             adv = oc - mc
             if adv > best_stay_adv:
                 best_stay_adv = adv
         
-        # 2. 评估 SWAP (我换成对手颜色)
         b_swap = copy.deepcopy(board)
-        # 对手那一子归我 (颜色变为 opp_c)
         b_swap.set_tile_colour(opp_move.x, opp_move.y, opp_c)
         
-        # 我现在是 opp_c，轮到对手 (my_c) 下
-        # 评估静态盘面优势
-        mc_swap = self.connectivity_evaluator.shortest_path_cost(b_swap, opp_c) # 我是OppC
-        oc_swap = self.connectivity_evaluator.shortest_path_cost(b_swap, my_c)  # 敌是MyC
-        
-        # 减去先手惩罚 (对手有一手棋权)
+        mc_swap = self.connectivity_evaluator.shortest_path_cost(b_swap, opp_c)
+        oc_swap = self.connectivity_evaluator.shortest_path_cost(b_swap, my_c)
         adv_swap = (oc_swap - mc_swap) - 0.7
         
-        # 决策：如果 Swap 优势显著
         if adv_swap > best_stay_adv + 0.2:
             logger.info(f"Swap Decision: STAY={best_stay_adv:.2f}, SWAP={adv_swap:.2f} -> SWAP")
             return Move(-1, -1)
@@ -234,39 +220,28 @@ class SmartHexAgent(AgentBase):
         return self._get_fallback_move(board)
 
     def _choose_defensive_block(self, board: Board) -> Optional[Move]:
-        """
-        [大局观核心] 战略阻断。
-        当对手 Dijkstra Cost 极低 (说明形成 VC) 时，寻找能最大化 Disrupt 的点。
-        """
         opp_c = self.opp_colour()
         my_c = self.colour
         
-        # 1. 基准 Cost
         base_opp_cost = self.connectivity_evaluator.shortest_path_cost(board, opp_c)
         
-        # 只有对手很强时才触发 (Cost < 3.5)
         if base_opp_cost > 3.5:
             return None 
 
-        # 2. 寻找最佳阻断点
         candidates = self._generate_local_candidates(board, opp_c, limit=30)
         best_block = None
         max_gain = 0.0
         
         for x, y in candidates:
-            # [重要] 过滤无效切断 (不要去填双桥的眼)
-            # 这里的 _is_inferior 会检查 Useless Cut
             if self.pattern_recognizer._is_inferior(board, x, y, my_c):
                 continue
                 
-            # 模拟阻断
             b_sim = copy.deepcopy(board)
             b_sim.set_tile_colour(x, y, my_c)
             
             new_opp_cost = self.connectivity_evaluator.shortest_path_cost(b_sim, opp_c)
             gain = new_opp_cost - base_opp_cost
             
-            # 如果增益显著 (例如破坏了 VC，Cost 至少增加 0.5)
             if gain > max_gain:
                 max_gain = gain
                 best_block = Move(x, y)
@@ -277,12 +252,8 @@ class SmartHexAgent(AgentBase):
         return None
 
     def _postprocess_mcts_move(self, board: Board, move: Move) -> Move:
-        """
-        后处理：利用 PatternRecognizer 再次清洗 MCTS 结果。
-        """
         if not move or (move.x == -1): return move
         
-        # 检查是否选了 Inferior Move (如无效切断)
         if self.pattern_recognizer._is_inferior(board, move.x, move.y, self.colour):
             logger.warning(f"Postprocess: Override Inferior Move {move}")
             return self._find_best_alternative(board)
@@ -290,7 +261,6 @@ class SmartHexAgent(AgentBase):
         return move
 
     def _find_best_alternative(self, board: Board) -> Move:
-        """寻找替代走法 (基于 Light Score)"""
         best = self._get_first_valid_move(board)
         best_score = -999.0
         
@@ -301,7 +271,6 @@ class SmartHexAgent(AgentBase):
             mv = Move(x, y)
             if not self._is_valid_move(mv, board): continue
             
-            # 再次过滤 Inferior
             if self.pattern_recognizer._is_inferior(board, x, y, self.colour):
                 continue
                 
@@ -312,20 +281,14 @@ class SmartHexAgent(AgentBase):
         return best
 
     def _score_move_light(self, board: Board, move: Move) -> float:
-        """
-        轻量评分函数。
-        结合 Dijkstra Cost 变化 和 Pattern Gamma 值。
-        """
         if move.x == -1: return -99.0
         
-        # 1. Inferior Check (快速剔除)
-        if self.pattern_recognizer._is_inferior(board, move.x, move.y, self.colour):
-            return -100.0
-
-        # 2. Dijkstra Cost Gain
         my = self.colour
         opp = self.opp_colour()
         
+        if self.pattern_recognizer._is_inferior(board, move.x, move.y, self.colour):
+            return -100.0
+
         cur_my = self.connectivity_evaluator.shortest_path_cost(board, my)
         cur_opp = self.connectivity_evaluator.shortest_path_cost(board, opp)
         
@@ -338,52 +301,98 @@ class SmartHexAgent(AgentBase):
         opp_gain = new_opp - cur_opp
         my_gain = cur_my - new_my
         
-        # 3. Gamma Bonus (从 PatternRecognizer 获取战术评分)
-        # get_prior 返回 [0, 1] 之间的值，可作为加分项
         gamma_score = self.pattern_recognizer.get_prior(board, move, my)
         
-        # 综合评分: 阻断对手 > 自己连接 > 战术形状
         return opp_gain + 0.7 * my_gain + 0.5 * gamma_score
 
     # ==========================================
-    # 基础工具与辅助
+    # 调试工具 (Debug Tools)
     # ==========================================
 
-    def _update_modules_colour(self, colour: Colour):
-        """Swap 后更新所有子模块颜色"""
-        self.colour = colour
-        self.pattern_recognizer.colour = colour
-        self.threat_detector.colour = colour
-        self.mcts_engine.colour = colour
+    def _debug_visualize_weights(self, board: Board, opp_move: Optional[Move], selected_move: Move):
+        """
+        [DEBUG] 将全盘权重分布格式化为字符串，并记录到日志文件 (DEBUG Level)。
+        """
+        lines = []
+        lines.append(f"\n{'='*20} [TURN {self.turn_count} DEBUG] {'='*20}")
+        lines.append(f"My Colour: {self.colour}, Opponent Last: {opp_move}")
+        
+        size = board.size
+        empty_spots = []
+        for x in range(size):
+            for y in range(size):
+                if board.tiles[x][y].colour is None:
+                    empty_spots.append(Move(x, y))
+        
+        gammas = self.pattern_recognizer.get_all_gammas(board, empty_spots, opp_move)
+        
+        sel_gamma = 0.0
+        if selected_move.x != -1:
+            sel_gamma = gammas.get((selected_move.x, selected_move.y), 0.0)
+            lines.append(f">> SELECTED MOVE: {selected_move} | Gamma: {sel_gamma:.4f}")
+        else:
+            lines.append(f">> SELECTED MOVE: SWAP")
+
+        # Top 10
+        sorted_spots = sorted(gammas.items(), key=lambda x: x[1], reverse=True)
+        lines.append(f"\n--- Top 10 Candidates (By Gamma) ---")
+        for i, ((x, y), g) in enumerate(sorted_spots[:10]):
+            mark = " <== CHOSEN" if (x == selected_move.x and y == selected_move.y) else ""
+            lines.append(f"#{i+1:2d}: ({x}, {y})  Val: {g:8.4f}{mark}")
+
+        # Heatmap
+        lines.append(f"\n--- Weight Heatmap (Grid View) ---")
+        lines.append("     " + " ".join([f"{y:^6}" for y in range(size)]))
+        
+        for x in range(size):
+            row_str = f"{x:2d} | "
+            for y in range(size):
+                tile = board.tiles[x][y]
+                if tile.colour == Colour.RED:
+                    val_str = "  R   "
+                elif tile.colour == Colour.BLUE:
+                    val_str = "  B   "
+                else:
+                    g = gammas.get((x, y), 0.0)
+                    if g > 100:
+                        val_str = f"*{g:4.0f}*"
+                    elif g > 10:
+                        val_str = f" {g:4.1f} "
+                    elif g < 0.01:
+                        val_str = "   .  "
+                    else:
+                        val_str = f" {g:4.1f} "
+                row_str += val_str + "|"
+            lines.append(row_str)
+        lines.append("="*60 + "\n")
+        
+        logger.debug("\n".join(lines))
+
+    # ==========================================
+    # 基础工具
+    # ==========================================
 
     def _check_priority_moves(self, board: Board) -> Optional[Move]:
-        """必杀/必防兜底"""
-        # 检查必杀
         win_cands = self.threat_detector._get_candidates(board, self.colour)
         for x, y in win_cands:
             b_sim = copy.deepcopy(board)
             b_sim.set_tile_colour(x, y, self.colour)
             if b_sim.has_ended(self.colour): return Move(x, y)
             
-        # 检查必防
         opp = self.opp_colour()
         lose_cands = self.threat_detector._get_candidates(board, opp)
         for x, y in lose_cands:
-            # 过滤无效填眼
             if self.pattern_recognizer._is_inferior(board, x, y, self.colour):
                 continue
             b_sim = copy.deepcopy(board)
             b_sim.set_tile_colour(x, y, opp)
             if b_sim.has_ended(opp): return Move(x, y)
-            
         return None
 
     def _generate_local_candidates(self, board: Board, focus_colour: Colour, limit=40) -> List[Tuple[int, int]]:
-        """生成局部候选点 (棋子周边 + 边缘关键点)"""
         candidates = set()
         size = board.size
         
-        # 1. 棋子周边 (Radius 1)
         for x in range(size):
             for y in range(size):
                 if board.tiles[x][y].colour == focus_colour:
@@ -393,7 +402,6 @@ class SmartHexAgent(AgentBase):
                         if 0 <= nx < size and 0 <= ny < size and board.tiles[nx][ny].colour is None:
                             candidates.add((nx, ny))
         
-        # 2. 边缘关键点 (Edge Templates 区域)
         if focus_colour == Colour.RED:
             for y in range(size):
                 if board.tiles[1][y].colour is None: candidates.add((1, y))
@@ -407,12 +415,14 @@ class SmartHexAgent(AgentBase):
 
     def _get_quick_move(self, board: Board) -> Move:
         """时间不足时的快速走法"""
+        # [日志] 记录快速走法被触发
+        logger.debug("Quick move triggered!")
+        
         threats = self.threat_detector.detect_immediate_threats(board, self.opp_colour())
         if threats: return Move(threats[0][0], threats[0][1])
         return self._get_first_valid_move(board)
 
     def _get_first_valid_move(self, board: Board) -> Move:
-        """兜底: 离中心最近的空位"""
         size = board.size
         c = size // 2
         best_dist = 999
@@ -428,9 +438,7 @@ class SmartHexAgent(AgentBase):
         return best_move
     
     def _get_fallback_move(self, board: Board) -> Move:
-        """安全兜底"""
         try:
-            # 尝试 MCTS 缓存
             if self.mcts_engine.root_node and self.mcts_engine.root_node.children:
                 best = max(self.mcts_engine.root_node.children, key=lambda c: c.visits)
                 if self._is_valid_move(best.move, board): return best.move
