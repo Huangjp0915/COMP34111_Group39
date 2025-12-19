@@ -1,0 +1,2 @@
+agents.Group39.SmartHexAgent SmartHexAgent
+
